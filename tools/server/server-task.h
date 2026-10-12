@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "ggml-pager.h"
 #include "llama.h"
 
 #include <string>
@@ -536,6 +537,10 @@ struct server_task_result_metrics : server_task_result {
     int n_tasks_deferred = 0;
 
     server_metrics metrics;
+
+    // expert pager totals of the CUDA backend (process-wide), shown only when it ran
+    bool             has_pager = false;
+    ggml_pager_stats pager     = {};
 
     virtual json to_json() override;
 

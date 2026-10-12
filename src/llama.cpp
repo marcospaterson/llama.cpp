@@ -14,6 +14,8 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml-pager.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -307,6 +309,19 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 ggml_backend_dev_name(dev.dev), ggml_backend_dev_description(dev.dev),
                 props.device_id ? props.device_id : "unknown id",
                 props.memory_free/1024/1024);
+
+        // hand the CPU backend's kernels to a device that runs paged experts (the CUDA backend does not link ggml-cpu)
+        if (auto * reg = ggml_backend_dev_backend_reg(dev.dev)) {
+            auto set_kernels = (ggml_backend_cuda_pager_set_cpu_kernels_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_pager_set_cpu_kernels");
+            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            ggml_backend_reg_t cpu_reg = cpu_dev ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
+            if (set_kernels && cpu_reg) {
+                ggml_pager_cpu_kernels kernels = {};
+                kernels.get_type_traits_cpu = ggml_get_type_traits_cpu;
+                kernels.vec_swiglu_f32 = (ggml_vec_swiglu_f32_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_vec_swiglu_f32");
+                set_kernels(&kernels);
+            }
+        }
     }
 
     return true;

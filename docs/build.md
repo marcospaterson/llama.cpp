@@ -317,6 +317,18 @@ NVFP4 and MXFP4 layers marked as W4A16 request 8-bit activations, so on Blackwel
 
 The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enable unified memory in Linux. This allows swapping to system RAM instead of crashing when the GPU VRAM is exhausted. In Windows this setting is available in the NVIDIA control panel as `System Memory Fallback`.
 
+#### Expert pager (experimental, CUDA)
+
+`--moe-pager` keeps the MoE expert weights (`ffn_{gate,up,down}_exps`) in host memory (buffer type `CUDA<n>_PAGED`, pinned when possible) and serves them through a cache of experts in VRAM; a missed expert is computed on the CPU instead of waiting for a copy. Equivalent to `-ot "\.ffn_(up|down|gate)_exps=CUDA0_PAGED"`.
+
+| variable | default | meaning |
+| --- | --- | --- |
+| `GGML_CUDA_PAGER_MIB` | `0` | VRAM budget of the expert cache in MiB, allocated at the first decode step and not counted by `--fit`. `0`: every expert is a miss |
+| `GGML_CUDA_PAGER_THREADS` | half the hardware threads | threads (including the compute thread) running the CPU path for missed experts |
+| `GGML_CUDA_PAGER_PREFILL` | `0` | `1`: fill the cache in layer order before the first step (test aid) |
+
+Batches of up to 8 tokens use the cache (one stream synchronisation per layer, CUDA graphs disabled); larger batches run the experts on the CPU backend. Statistics are in `/metrics` of `llama-server` and in a line logged when a slot is released.
+
 ### Peer Access
 
 The environment variable `GGML_CUDA_P2P` can be set to enable peer-to-peer access between multiple GPUs, allowing them to transfer data directly rather than to go through system memory.

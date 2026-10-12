@@ -1222,6 +1222,8 @@ const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
 //
 
 const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+// expert tensors the CUDA expert pager can hold (separate gate, up and down; not the merged gate_up)
+const char * const LLM_FFN_EXPS_PAGED_REGEX = "\\.ffn_(up|down|gate)_exps";
 
 const char * const LLM_FFN_DENSE_REGEX = "\\.ffn_(up|down|gate)\\.";
 

@@ -1514,6 +1514,9 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context concurrent_stream_context;
 
+    // expert pager (pager.cuh), created on the first MUL_MAT_ID with paged weights
+    struct ggml_cuda_pager * pager = nullptr;
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {

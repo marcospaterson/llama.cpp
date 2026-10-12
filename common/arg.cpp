@@ -248,6 +248,34 @@ std::vector<std::string> common_arg::get_env() const {
 // utils
 //
 
+// NULL-terminated extra buffer types advertised by a device (NULL if none)
+static ggml_backend_buffer_type_t * device_extra_bufts(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return nullptr;
+    }
+    auto fn = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    return fn ? fn(dev) : nullptr;
+}
+
+// the paged expert buffer type of the first GPU device (the CUDA backend's "CUDA<n>_PAGED")
+static ggml_backend_buffer_type_t find_paged_buft() {
+    ggml_backend_load_all();
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        for (auto * extra = device_extra_bufts(dev); extra && *extra; ++extra) {
+            const std::string name = ggml_backend_buft_name(*extra);
+            if (name.size() > 6 && name.compare(name.size() - 6, 6, "_PAGED") == 0) {
+                return *extra;
+            }
+        }
+    }
+    return nullptr;
+}
+
 // Helper function to parse tensor buffer override strings
 static void parse_tensor_buffer_overrides(const std::string & value, std::vector<llama_model_tensor_buft_override> & overrides) {
     ggml_backend_load_all();
@@ -258,6 +286,10 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         auto * buft = ggml_backend_dev_buffer_type(dev);
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
+        }
+        // extra buffer types of the device (e.g. CUDA0_PAGED)
+        for (auto * extra = device_extra_bufts(dev); extra && *extra; ++extra) {
+            buft_list[ggml_backend_buft_name(*extra)] = *extra;
         }
     }
 
@@ -2766,6 +2798,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-pager"},
+        "keep all Mixture of Experts (MoE) weights in host memory and page them through a VRAM expert cache (CUDA only; "
+        "cache size from the environment variable GGML_CUDA_PAGER_MIB, default 0 = every expert is a miss served by the CPU)",
+        [](common_params & params) {
+            auto * buft = find_paged_buft();
+            if (!buft) {
+                throw std::invalid_argument("--moe-pager requires a CUDA device");
+            }
+            params.tensor_buft_overrides.push_back({ LLM_FFN_EXPS_PAGED_REGEX, buft });
+        }
+    ).set_env("LLAMA_ARG_MOE_PAGER"));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",

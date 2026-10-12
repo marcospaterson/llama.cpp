@@ -17,6 +17,8 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "ggml-backend.h"
+#include "ggml-pager.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -38,6 +40,40 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Expert pager telemetry of the CUDA backend (process-wide totals), fetched through the backend registry so that the server
+// has no compile-time dependency on CUDA. Returns false when the backend has no pager or it has not run.
+static bool server_get_pager_stats(ggml_pager_stats & out) {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+    if (!reg) {
+        return false;
+    }
+    auto fn = (ggml_backend_cuda_pager_get_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_pager_get_stats");
+    if (!fn) {
+        return false;
+    }
+    fn(&out);
+    return out.blocks > 0;
+}
+
+// one-line summary at slot release: totals, and the change since the previous summary
+static void server_log_pager_summary() {
+    static ggml_pager_stats last = {};
+    ggml_pager_stats cur = {};
+    if (!server_get_pager_stats(cur)) {
+        return;
+    }
+    const double d_hit  = (double) (cur.hits   - last.hits);
+    const double d_miss = (double) (cur.misses - last.misses);
+    const double d_tot  = std::max(d_hit + d_miss, 1.0);
+    LOG_INF("pager: hits = %" PRIu64 " (+%.0f), misses = %" PRIu64 " (+%.0f), hit rate = %.3f (since last %.3f), resident = %" PRIu64
+            ", pool = %.1f MiB, copied = %.1f MiB, cpu = %.1f ms (+%.1f), host = %.1f ms (+%.1f), sync = %.1f ms (+%.1f), syncs = %" PRIu64 " (+%" PRIu64 ")\n",
+            cur.hits, d_hit, cur.misses, d_miss,
+            (double) cur.hits / std::max((double) (cur.hits + cur.misses), 1.0), d_hit / d_tot,
+            cur.resident_experts, cur.pool_bytes / 1048576.0, cur.bytes_copied / 1048576.0,
+            cur.cpu_ms, cur.cpu_ms - last.cpu_ms, cur.host_ms, cur.host_ms - last.host_ms, cur.sync_ms, cur.sync_ms - last.sync_ms, cur.syncs, cur.syncs - last.syncs);
+    last = cur;
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -599,6 +635,8 @@ struct server_slot {
             reset();
 
             callback_on_release(id);
+
+            server_log_pager_summary();
         }
     }
 
@@ -5033,6 +5071,7 @@ void server_routes::init_routes() {
             res->headers["Process-Start-Time-Unix"] = std::to_string(cached_metrics.t_start);
             server_task_result_metrics tmp;
             tmp.metrics = cached_metrics;
+            tmp.has_pager = server_get_pager_stats(tmp.pager);
             res->content_type = "text/plain; version=0.0.4";
             res->status = 200;
             res->data = tmp.to_metrics();
@@ -5072,6 +5111,8 @@ void server_routes::init_routes() {
 
             auto res_task = dynamic_cast<server_task_result_metrics*>(result.get());
             GGML_ASSERT(res_task != nullptr);
+
+            res_task->has_pager = server_get_pager_stats(res_task->pager);
 
             res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->metrics.t_start);
             res->content_type = "text/plain; version=0.0.4";

@@ -1613,6 +1613,24 @@ std::string server_task_result_metrics::to_metrics() {
     add_items("counter", counters);
     add_items("gauge",   gauges);
 
+    if (has_pager) {
+        add_items("counter", {
+            { "pager_hits_total",         "Expert evaluations served from the VRAM pool (pager)",          (double) pager.hits },
+            { "pager_misses_total",       "Expert evaluations served by the CPU (pager)",                  (double) pager.misses },
+            { "pager_bytes_copied_total", "Bytes copied from host memory into the VRAM pool (pager)",      (double) pager.bytes_copied },
+            { "pager_cpu_seconds_total",  "Wall time of the CPU path for missed experts (pager)",          pager.cpu_ms / 1.e3 },
+            { "pager_host_seconds_total", "Compute-thread time inside pager blocks after the synchronisation",   pager.host_ms / 1.e3 },
+            { "pager_sync_seconds_total", "Time blocked in the pager's per-layer stream synchronisation",  pager.sync_ms / 1.e3 },
+            { "pager_syncs_total",        "Stream synchronisations performed by the pager",                (double) pager.syncs },
+            { "pager_blocks_total",       "Expert blocks executed by the pager",                           (double) pager.blocks },
+        });
+        add_items("gauge", {
+            { "pager_resident_experts",   "Experts resident in the VRAM pool (pager)",                     (double) pager.resident_experts },
+            { "pager_pool_bytes",         "VRAM allocated for the pager pools",                            (double) pager.pool_bytes },
+            { "pager_hit_ratio",          "Cumulative hit ratio of the pager",                             (double) pager.hits / std::max((double) (pager.hits + pager.misses), 1.0) },
+        });
+    }
+
     // labeled counter: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
         prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"

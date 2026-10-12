@@ -70,6 +70,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/pager.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -90,6 +91,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -696,6 +698,14 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+    // joins the pager's worker threads and frees its VRAM pools; the stream is idle (the backend is being freed)
+    if (pager != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        ggml_cuda_pager_destroy(pager);
+        pager = nullptr;
+    }
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -1326,6 +1336,116 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}
 
+// paged buffer type: expert weights held in host memory (pinned when possible) and executed by the expert pager (pager.cuh).
+// Its tensors are host tensors (is_host), so the loader reads straight into them and the CPU backend can run any op on them.
+// It is neither a CUDA device buffer nor the host buffer type: get_name and free_buffer are distinct, so the identity tests
+// (ggml_backend_buft_is_cuda, ggml_backend_buffer_is_cuda) are false for it.
+
+struct ggml_backend_cuda_paged_buft_context {
+    int device;
+    std::string name;
+};
+
+static const char * ggml_backend_cuda_paged_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return ((ggml_backend_cuda_paged_buft_context *) buft->context)->name.c_str();
+}
+
+bool ggml_cuda_buft_is_paged(ggml_backend_buffer_type_t buft) {
+    return buft && buft->iface.get_name == ggml_backend_cuda_paged_buffer_type_name;
+}
+
+int ggml_cuda_tensor_paged_device(const ggml_tensor * t) {
+    if (!t) {
+        return -1;
+    }
+    const ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+    if (!buffer || !ggml_cuda_buft_is_paged(buffer->buft)) {
+        return -1;
+    }
+    return ((ggml_backend_cuda_paged_buft_context *) buffer->buft->context)->device;
+}
+
+static std::mutex                 ggml_cuda_paged_mutex;
+static std::unordered_set<void *> ggml_cuda_paged_pinned; // allocations made with cudaMallocHost
+
+static void ggml_backend_cuda_paged_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    void * ptr = buffer->context;
+    bool pinned;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_paged_mutex);
+        pinned = ggml_cuda_paged_pinned.erase(ptr) > 0;
+    }
+    if (pinned) {
+        CUDA_CHECK(cudaFreeHost(ptr));
+    } else {
+        free(ptr);
+    }
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_paged_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    const size_t alloc_size = std::max<size_t>(size, 1); // the loader allocates 0-byte dummy buffers
+
+    bool pinned = true;
+    void * ptr = ggml_cuda_host_malloc(alloc_size);
+    if (ptr == nullptr) {
+        pinned = false;
+        if (posix_memalign(&ptr, 4096, alloc_size) != 0) {
+            GGML_LOG_ERROR("%s: failed to allocate %.2f MiB of host memory\n", __func__, size / 1024.0 / 1024.0);
+            return nullptr;
+        }
+        static std::once_flag warned;
+        std::call_once(warned, [] { GGML_LOG_WARN("%s: pinned memory unavailable, paged experts use pageable host memory\n", "CUDA_PAGED"); });
+    }
+    if (pinned) {
+        std::lock_guard<std::mutex> lock(ggml_cuda_paged_mutex);
+        ggml_cuda_paged_pinned.insert(ptr);
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = ggml_backend_cuda_paged_buffer_free_buffer;
+    return buffer;
+}
+
+static bool ggml_backend_cuda_paged_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return true;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_paged_buffer_type(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type ggml_backend_cuda_paged_buffer_types[GGML_CUDA_MAX_DEVICES];
+    static bool initialized = false;
+
+    if (!initialized) {
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            ggml_backend_cuda_paged_buffer_types[i] = {
+                /* .iface    = */ {
+                    /* .get_name            = */ ggml_backend_cuda_paged_buffer_type_name,
+                    /* .alloc_buffer        = */ ggml_backend_cuda_paged_buffer_type_alloc_buffer,
+                    /* .alloc_buffer_n      = */ NULL,
+                    /* .get_alignment       = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+                    /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
+                    /* .get_alloc_size      = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                    /* .get_alloc_size_n    = */ NULL,
+                    /* .is_host             = */ ggml_backend_cuda_paged_buffer_type_is_host,
+                },
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context  = */ new ggml_backend_cuda_paged_buft_context{i, GGML_CUDA_NAME + std::to_string(i) + "_PAGED"},
+            };
+        }
+        initialized = true;
+    }
+
+    return &ggml_backend_cuda_paged_buffer_types[device];
+}
+
 /// kernels
 
 typedef void (*ggml_cuda_op_mul_mat_t)(
@@ -1673,13 +1793,13 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
-static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
-                                          const ggml_tensor * ffn_gate,
-                                          const ggml_tensor * glu,
-                                          const ggml_tensor * ffn_up_bias = nullptr,
-                                          const ggml_tensor * ffn_gate_bias = nullptr,
-                                          const ggml_tensor * ffn_up_scale = nullptr,
-                                          const ggml_tensor * ffn_gate_scale = nullptr) {
+static bool ggml_cuda_should_fuse_mul_mat_impl(const ggml_tensor * ffn_up,
+                                               const ggml_tensor * ffn_gate,
+                                               const ggml_tensor * glu,
+                                               const ggml_tensor * ffn_up_bias,
+                                               const ggml_tensor * ffn_gate_bias,
+                                               const ggml_tensor * ffn_up_scale,
+                                               const ggml_tensor * ffn_gate_scale) {
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 
@@ -1767,7 +1887,24 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+                                          const ggml_tensor * ffn_gate,
+                                          const ggml_tensor * glu,
+                                          const ggml_tensor * ffn_up_bias = nullptr,
+                                          const ggml_tensor * ffn_gate_bias = nullptr,
+                                          const ggml_tensor * ffn_up_scale = nullptr,
+                                          const ggml_tensor * ffn_gate_scale = nullptr) {
+    // paged weights are host memory: no stock kernel may dereference them (the pager runs those nodes)
+    if (ggml_cuda_tensor_is_paged(ffn_up->src[0]) || ggml_cuda_tensor_is_paged(ffn_gate->src[0])) {
+        return false;
+    }
+    return ggml_cuda_should_fuse_mul_mat_impl(ffn_up, ffn_gate, glu, ffn_up_bias, ffn_gate_bias, ffn_up_scale, ffn_gate_scale);
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+    if (ggml_cuda_tensor_is_paged(tensor->src[0])) {
+        return false;
+    }
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -1796,6 +1933,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 }
 
 static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+    if (ggml_cuda_tensor_is_paged(tensor->src[0])) {
+        return false;
+    }
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -1937,6 +2077,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    // the pager synchronises the stream on every block
+    if (ggml_cuda_tensor_is_paged(src0)) {
+        return true;
+    }
+
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
     }
@@ -1969,6 +2114,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(!ggml_cuda_tensor_is_paged(src0) && "paged weights are executed by the pager");
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2316,7 +2462,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            ggml_cuda_mul_mat_id(ctx, dst);
+            if (ggml_cuda_tensor_is_paged(dst->src[0])) {
+                ggml_cuda_pager_mul_mat_id(ctx, dst);
+            } else {
+                ggml_cuda_mul_mat_id(ctx, dst);
+            }
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -3236,6 +3386,10 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+bool ggml_cuda_should_fuse_mul_mat_for_pager(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
+    return ggml_cuda_should_fuse_mul_mat_impl(up, gate, glu, nullptr, nullptr, nullptr, nullptr);
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -3504,6 +3658,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+
+    // paged expert block (gate, up, swiglu, down): executed as one unit by the pager, independent of GGML_CUDA_DISABLE_FUSION
+    if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID && ggml_cuda_tensor_is_paged(cgraph->nodes[i]->src[0])) {
+        return ggml_cuda_pager_try_block(*cuda_ctx, cgraph, i);
+    }
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
@@ -4443,8 +4602,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
+                        // weights of the expert pager live in host memory (a MUL_MAT_ID src[0] only, see supports_op)
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
+                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)) ||
+                               (j == 0 && node->op == GGML_OP_MUL_MAT_ID && ggml_cuda_tensor_paged_device(node->src[j]) == cuda_ctx->device));
                     }
                 }
 #else
@@ -5252,6 +5413,14 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // weights in a paged buffer: only MUL_MAT_ID with the paged tensor as src[0], run by the expert pager. Every other op
+    // is rejected, so the paged buffer type is never selected automatically and the CPU backend runs whatever it cannot.
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (ggml_cuda_tensor_is_paged(op->src[i])) {
+            return ggml_cuda_pager_supports_op(dev_ctx->device, op);
+        }
+    }
+
     // check if all the sources are allocated on this device
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda(op->src[i]->buffer->buft)) {
@@ -5733,7 +5902,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
+           (ggml_cuda_buft_is_paged(buft) && buft->device == dev);
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -5885,8 +6055,28 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// extra buffer types of a device (NULL-terminated), consumed by make_gpu_buft_list in llama-model.cpp
+static ggml_backend_buffer_type_t * ggml_backend_cuda_dev_get_extra_bufts(ggml_backend_dev_t dev) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    static std::mutex mutex;
+    static ggml_backend_buffer_type_t bufts[GGML_CUDA_MAX_DEVICES][2];
+    std::lock_guard<std::mutex> lock(mutex);
+    bufts[dev_ctx->device][0] = ggml_backend_cuda_paged_buffer_type(dev_ctx->device);
+    bufts[dev_ctx->device][1] = nullptr;
+    return bufts[dev_ctx->device];
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        return (void *)ggml_backend_cuda_dev_get_extra_bufts;
+    }
+    if (strcmp(name, "ggml_backend_cuda_pager_get_stats") == 0) {
+        return (void *)ggml_cuda_pager_get_stats;
+    }
+    if (strcmp(name, "ggml_backend_cuda_pager_set_cpu_kernels") == 0) {
+        return (void *)ggml_cuda_pager_set_cpu_kernels;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
