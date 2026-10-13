@@ -100,9 +100,52 @@ struct pager_global_stats {
     std::atomic<uint64_t> copy_bytes{0};
     std::atomic<uint64_t> promo_lat_us{0};   // sum over committed or aborted promotions of issue to commit time
     std::atomic<uint64_t> promo_lat_tok{0};  // ... and of the tokens elapsed
-    std::atomic<uint64_t> bw_mbps{0};   // measured (or configured) host to device bandwidth, bytes per microsecond
+    std::atomic<uint64_t> bw_mbps{0};
+    std::atomic<uint32_t> enabled{0};
+    std::atomic<uint64_t> generation{0};
+    std::atomic<uint64_t> rebuild_us{0};
+    std::atomic<int64_t>  obtained_mib{0};
+    std::atomic<int32_t>  policy{0}, admit_misses{0}, admit_window{0};
+    std::atomic<uint32_t> n_slots{0}, warm_queued{0}, warm_skipped{0}, pinned_count{0};
+    std::atomic<uint64_t> slot_bytes{0};   // measured (or configured) host to device bandwidth, bytes per microsecond
 };
 static pager_global_stats g_stats;
+
+// Run-time control block shared by every pager of the process. configure() may be called from any thread; a pager applies the
+// request at its next safe point (see ggml_cuda_pager::apply_pending). The values are sticky: they are also the initial
+// configuration of a pager that does not exist yet (e.g. --moe-pager-mib before the first decode).
+struct pager_ctl {
+    std::mutex            m;
+    std::atomic<uint64_t> gen_requested{0};
+    int32_t               pool_mib = -1, policy = -1, admit_misses = -1, admit_window = -1;
+    std::vector<int32_t>  warm, pinned;          // flat (layer, expert) pairs of the latest request
+    std::vector<ggml_cuda_pager *> pagers;       // live pagers, for ggml_cuda_pager_apply()
+};
+static pager_ctl g_ctl;
+
+uint64_t ggml_cuda_pager_configure(const ggml_pager_config * c) {
+    std::lock_guard<std::mutex> lk(g_ctl.m);
+    if (c->pool_mib >= 0)      { g_ctl.pool_mib = c->pool_mib; }
+    if (c->policy >= 0)        { g_ctl.policy = c->policy; }
+    if (c->admit_misses >= 0)  { g_ctl.admit_misses = c->admit_misses; }
+    if (c->admit_window >= 0)  { g_ctl.admit_window = c->admit_window; }
+    g_ctl.warm.assign(c->warm, c->warm + (c->warm ? 2 * std::max(c->n_warm, 0) : 0));
+    g_ctl.pinned.assign(c->pinned, c->pinned + (c->pinned ? 2 * std::max(c->n_pinned, 0) : 0));
+    return g_ctl.gen_requested.fetch_add(1) + 1;
+}
+
+static int64_t pager_requested_mib() {
+    std::lock_guard<std::mutex> lk(g_ctl.m);
+    if (g_ctl.pool_mib >= 0) {
+        return g_ctl.pool_mib;
+    }
+    const char * env = getenv("GGML_CUDA_PAGER_MIB");
+    return env ? std::max<long long>(atoll(env), 0) : -1;
+}
+
+size_t ggml_cuda_pager_budget_bytes() {
+    return (size_t) std::max<int64_t>(pager_requested_mib(), 0) * 1024 * 1024;
+}
 
 void ggml_cuda_pager_set_cpu_kernels(const ggml_pager_cpu_kernels * kernels) {
     g_cpu_swiglu.store(kernels->vec_swiglu_f32, std::memory_order_release);
@@ -131,21 +174,26 @@ void ggml_cuda_pager_get_stats(ggml_pager_stats * out) {
     out->copy_busy_ms         = busy / 1000.0;
     out->promo_latency_ms_sum  = g_stats.promo_lat_us.load(std::memory_order_relaxed) / 1000.0;
     out->promo_latency_tokens_sum = g_stats.promo_lat_tok.load(std::memory_order_relaxed);
+    out->enabled              = g_stats.enabled.load(std::memory_order_relaxed);
+    out->generation           = g_stats.generation.load(std::memory_order_relaxed);
+    out->generation_requested = g_ctl.gen_requested.load(std::memory_order_relaxed);
+    out->rebuild_ms           = g_stats.rebuild_us.load(std::memory_order_relaxed) / 1000.0;
+    out->pool_mib_requested   = pager_requested_mib();
+    out->pool_mib_obtained    = g_stats.obtained_mib.load(std::memory_order_relaxed);
+    out->policy               = g_stats.policy.load(std::memory_order_relaxed);
+    out->admit_misses         = g_stats.admit_misses.load(std::memory_order_relaxed);
+    out->admit_window         = g_stats.admit_window.load(std::memory_order_relaxed);
+    out->n_slots              = g_stats.n_slots.load(std::memory_order_relaxed);
+    out->slot_bytes           = g_stats.slot_bytes.load(std::memory_order_relaxed);
+    out->warm_queued          = g_stats.warm_queued.load(std::memory_order_relaxed);
+    out->warm_skipped         = g_stats.warm_skipped.load(std::memory_order_relaxed);
+    out->pinned_count         = g_stats.pinned_count.load(std::memory_order_relaxed);
     out->bandwidth_gbps       = g_stats.bw_mbps.load(std::memory_order_relaxed) / 1e3;
 }
 
 static const ggml_type_traits_cpu * pager_cpu_traits(ggml_type type) {
     ggml_get_type_traits_cpu_t fn = g_cpu_traits.load(std::memory_order_acquire);
     return fn ? fn(type) : nullptr;
-}
-
-size_t ggml_cuda_pager_budget_bytes() {
-    const char * env = getenv("GGML_CUDA_PAGER_MIB");
-    if (!env) {
-        return 0;
-    }
-    const long long mib = atoll(env);
-    return mib > 0 ? (size_t) mib * 1024 * 1024 : 0;
 }
 
 static int pager_n_threads() {
@@ -443,8 +491,19 @@ public:
         {
             std::lock_guard<std::mutex> lk(mtx_);
             q_.push_back(j);
+            pending_++;
         }
         cv_.notify_one();
+    }
+
+    // Blocks until every submitted job has finished on the device (its event completed, poison and bounce copies included).
+    // Afterwards nothing queued by this copier reads host memory or writes device memory.
+    void quiesce() {
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cv_idle_.wait(lk, [&] { return pending_ == 0; });
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
 
     // moves the ids of completed copies into `out`
@@ -471,6 +530,9 @@ private:
         free_ev_.push_back(o.ev);
         std::lock_guard<std::mutex> lk(mtx_);
         done_.push_back(o.id);
+        if (--pending_ == 0) {
+            cv_idle_.notify_all();
+        }
     }
 
     void reap(bool block) {
@@ -523,6 +585,12 @@ private:
                     reap(true); // out of events: wait for the oldest job
                 }
                 pager_do_copy(j, stream_, bounce);
+                if (j.op == 1) {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    if (--pending_ == 0) {
+                        cv_idle_.notify_all();
+                    }
+                }
                 if (j.op == 0) {
                     size_t total = 0;
                     for (int k = 0; k < j.n; k++) {
@@ -546,6 +614,8 @@ private:
     std::thread             thread_;
     std::mutex              mtx_;
     std::condition_variable cv_;
+    std::condition_variable cv_idle_;
+    uint64_t                pending_ = 0; // jobs submitted and not yet reported (guarded by mtx_)
     std::deque<copy_job>    q_;       // guarded by mtx_
     std::vector<uint64_t>   done_;    // guarded by mtx_
     bool                    stop_ = false;
@@ -631,6 +701,16 @@ struct ggml_cuda_pager {
     size_t   slot_bytes = 0;     // sum of the strides, the cache's expert size
     pager_policy policy = POLICY_LRU;
     bool     sync_copy = false;
+    int      admit_misses = 2, admit_window = 16;
+    size_t   tail[3] = {};
+    bool     geom_ready = false, bw_known = false, degraded = false;
+    int      n_cached_groups = 0;
+    size_t   unpadded_mean = 0, worst_expert = 0, obtained_bytes = 0;
+    ggml_cuda_pager_cache_config cc_ = {};
+    uint64_t applied_gen = 0, generation = 0;
+    std::unordered_map<int, int> layer_to_gid;
+    std::unordered_set<uint32_t> warm_out;              // hints queued in the cache and not yet issued
+    std::deque<std::pair<uint32_t, double>> warm_keys;  // warm set not yet handed to the cache (key, priority)
 
     // promotions
     std::unordered_map<uint64_t, inflight_promo> inflight;
@@ -673,12 +753,30 @@ struct ggml_cuda_pager {
         device(device), budget(ggml_cuda_pager_budget_bytes()), workers(pager_n_threads()) {
         policy    = pager_policy_from_env();
         sync_copy = pager_env_flag("GGML_CUDA_PAGER_SYNC_COPY");
+        admit_misses = (int) std::max(1.0, pager_env_double("GGML_CUDA_PAGER_ADMIT_MISSES", 2.0));
+        admit_window = (int) std::max(0.0, pager_env_double("GGML_CUDA_PAGER_ADMIT_WINDOW", 16.0));
+        {
+            // the requests made before this pager existed are its initial configuration
+            std::lock_guard<std::mutex> lk(g_ctl.m);
+            if (g_ctl.policy >= 0)       { policy = (pager_policy) g_ctl.policy; }
+            if (g_ctl.admit_misses >= 1) { admit_misses = g_ctl.admit_misses; }
+            if (g_ctl.admit_window >= 0) { admit_window = g_ctl.admit_window; }
+            applied_gen = g_ctl.gen_requested.load();
+            generation = applied_gen;
+            g_stats.generation.store(std::max<uint64_t>(g_stats.generation.load(), generation));
+            g_ctl.pagers.push_back(this);
+        }
+        g_stats.enabled.store(1);
         static const char * names[] = { "lru", "lfu", "fwlru", "static" };
         GGML_LOG_INFO("%s: device %d, pool %.0f MiB, policy %s%s, %d CPU threads\n", "pager", device, budget / 1048576.0,
                       names[policy], sync_copy ? " (synchronous copies)" : "", pager_n_threads());
     }
 
     ~ggml_cuda_pager() {
+        {
+            std::lock_guard<std::mutex> lk(g_ctl.m);
+            g_ctl.pagers.erase(std::remove(g_ctl.pagers.begin(), g_ctl.pagers.end(), this), g_ctl.pagers.end());
+        }
         // the worker threads are joined by ~pager_workers after this body; they only run inside exec(), which has returned
         ggml_cuda_set_device(device);
         copier.reset(); // joins the copier thread after its queue is empty
@@ -790,7 +888,10 @@ struct ggml_cuda_pager {
         return w->ne[0] % MATRIX_ROW_PADDING != 0 ? ggml_row_size(w->type, MATRIX_ROW_PADDING - w->ne[0] % MATRIX_ROW_PADDING) : 0;
     }
 
+    // Drop the pool and the cache. The caller guarantees that no kernel and no copy touches the pools any more (see
+    // drain_for_rebuild()). The VRAM goes back to the driver here.
     void free_pools() {
+        ggml_cuda_set_device(device);
         for (int k = 0; k < 3; k++) {
             if (pool[k]) {
                 CUDA_CHECK(cudaFree(pool[k]));
@@ -803,75 +904,113 @@ struct ggml_cuda_pager {
         for (pager_group & g : groups) {
             g.cached = false;
         }
+        g_stats.pool_bytes.fetch_sub(reported_pool_bytes);
+        reported_pool_bytes = 0;
+        g_stats.resident.fetch_sub(reported_resident);
+        reported_resident = 0;
+        pub = {};
+        inflight.clear();
+        inflight_bytes = 0;
+        sync_done.clear();
+        obtained_bytes = 0;
+        warm_keys.clear();
+        warm_out.clear();
+        g_stats.queue_depth.store(0, std::memory_order_relaxed);
     }
 
-    // Called once, after the first graph has been scanned. Experts of every fused group get one common slot size (the sum
-    // of per-role strides, each stride a multiple of the block sizes of all types seen in that role), so the cache has a
-    // single size class; the device pools are budget + staging in total. Anything that does not fit stays uncached.
-    void build_pools(cudaStream_t stream) {
-        pools_built = true;
-        ggml_cuda_set_device(device);
+    // Stage 1 of every rebuild: after this returns the copier has nothing queued or running (so nothing writes into the pools or
+    // reads paged host memory for them) and every finished promotion has been committed. The compute stream was synchronised
+    // by the caller and this thread launches no kernel until the rebuild is over.
+    void drain_for_rebuild(cudaStream_t stream) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (copier) {
+            copier->quiesce();
+        }
+        if (cache) {
+            collect_and_commit();
+            if (copier) {
+                copier->quiesce(); // the commits above may have queued poison jobs (debug builds)
+            }
+        }
+    }
 
+    enum pool_status { POOL_OK, POOL_TOO_SMALL, POOL_ALLOC_FAILED, POOL_CACHE_FAILED };
+
+    // Geometry shared by every pool size: per-role strides (multiples of the block sizes of all types in the role), slot size.
+    bool compute_geometry() {
+        if (geom_ready) {
+            return n_cached_groups > 0;
+        }
+        geom_ready = true;
         uint64_t unit[3] = { 16, 16, 16 };
-        size_t   maxb[3] = {}, tail[3] = {};
-        int      n_cached = 0;
+        size_t   maxb[3] = {};
+        n_cached_groups = 0;
         epl = 0;
+        size_t sum = 0;
         for (const pager_group & g : groups) {
             epl = std::max<uint32_t>(epl, g.n_expert);
             if (g.n != 3) {
                 continue;
             }
-            n_cached++;
+            n_cached_groups++;
+            size_t b = 0;
             for (int k = 0; k < 3; k++) {
                 unit[k] = pager_lcm(unit[k], ggml_type_size(g.w[k]->type));
                 maxb[k] = std::max<size_t>(maxb[k], g.w[k]->nb[2]);
                 tail[k] = std::max<size_t>(tail[k], tail_padding(g.w[k]));
+                b += g.w[k]->nb[2];
             }
+            sum += b;
+            worst_expert = std::max(worst_expert, b);
         }
-        if (n_cached == 0 || budget == 0) {
-            return;
+        if (n_cached_groups == 0) {
+            return false;
         }
+        unpadded_mean = sum / n_cached_groups;
         slot_bytes = 0;
         for (int k = 0; k < 3; k++) {
             stride[k] = (maxb[k] + unit[k] - 1) / unit[k] * unit[k];
             slot_bytes += stride[k];
         }
-        size_t unpadded = 0, worst = 0;
-        for (const pager_group & g : groups) {
-            if (g.n == 3) {
-                size_t b = 0;
-                for (int k = 0; k < 3; k++) {
-                    b += g.w[k]->nb[2];
-                }
-                unpadded += b;
-                worst = std::max(worst, b);
+        // layer numbers of the model (blk.N.) to group indices, for warm sets and pins given by model layer
+        for (size_t g = 0; g < groups.size(); g++) {
+            int layer = -1;
+            if (sscanf(groups[g].w[0]->name, "blk.%d.", &layer) == 1) {
+                layer_to_gid[layer] = (int) g;
             }
         }
-        const size_t phys_slots = budget / slot_bytes;       // including the null slot
+        return true;
+    }
+
+    cudaStream_t cur_stream_or(cudaStream_t s) const { return s ? s : cur_stream; }
+
+    // Try one pool of `pool_budget` bytes (pool + staging + null slot). On any failure nothing stays allocated.
+    pool_status make_pool(size_t pool_budget, cudaStream_t stream) {
+        ggml_cuda_set_device(device);
+        const size_t phys_slots = pool_budget / slot_bytes;       // including the null slot
         size_t staging = (size_t) (pager_env_double("GGML_CUDA_PAGER_STAGING_MIB", 64.0) * 1048576.0);
-        staging = std::min(staging, budget / 4);
+        staging = std::min(staging, pool_budget / 4);
         staging = std::max<size_t>(staging / slot_bytes, 2) * slot_bytes;
         if (phys_slots < 4 || (phys_slots - 1) * slot_bytes <= staging + slot_bytes) {
-            GGML_LOG_WARN("%s: pool of %.0f MiB holds fewer than %d slots of %.2f MiB, running without a pool\n", "pager",
-                          budget / 1048576.0, 4, slot_bytes / 1048576.0);
-            return;
+            return POOL_TOO_SMALL;
         }
-        ggml_cuda_pager_cache_config cc;
-        cc.n_layers          = (uint32_t) groups.size();
-        cc.experts_per_layer = epl;
-        cc.bytes_per_expert  = (uint32_t) slot_bytes;
-        cc.staging_bytes     = staging;
-        cc.budget_bytes      = (phys_slots - 1) * slot_bytes - staging;
-        cc.policy            = policy == POLICY_STATIC ? POLICY_LRU : (int) policy;
-        cc.half_life_tokens  = pager_env_double("GGML_CUDA_PAGER_HALFLIFE", 64.0);
-        cc.admit_min_misses  = (uint32_t) std::max(1.0, pager_env_double("GGML_CUDA_PAGER_ADMIT_MISSES", 2.0));
-        cc.admit_window_tokens = (uint64_t) std::max(0.0, pager_env_double("GGML_CUDA_PAGER_ADMIT_WINDOW", 16.0));
-        cc.max_bytes_per_token = (uint64_t) (std::max(0.0, pager_env_double("GGML_CUDA_PAGER_TOKEN_MIB", 0.0)) * 1048576.0);
+        cc_ = {};
+        cc_.n_layers          = (uint32_t) groups.size();
+        cc_.experts_per_layer = epl;
+        cc_.bytes_per_expert  = (uint32_t) slot_bytes;
+        cc_.staging_bytes     = staging;
+        cc_.budget_bytes      = (phys_slots - 1) * slot_bytes - staging;
+        cc_.policy            = policy == POLICY_STATIC ? POLICY_LRU : (int) policy;
+        cc_.half_life_tokens  = pager_env_double("GGML_CUDA_PAGER_HALFLIFE", 64.0);
+        cc_.admit_min_misses  = (uint32_t) std::max(1, admit_misses);
+        cc_.admit_window_tokens = (uint64_t) std::max(0, admit_window);
+        cc_.max_bytes_per_token = (uint64_t) (std::max(0.0, pager_env_double("GGML_CUDA_PAGER_TOKEN_MIB", 0.0)) * 1048576.0);
+        cc_.candidate_ttl_tokens = (uint64_t) std::max(0.0, pager_env_double("GGML_CUDA_PAGER_CANDIDATE_TTL", 128.0)); // stale warm hints must not evict
         try {
-            cache = std::make_unique<ggml_cuda_pager_cache>(cc);
+            cache = std::make_unique<ggml_cuda_pager_cache>(cc_);
         } catch (const std::exception & e) {
-            GGML_LOG_ERROR("%s: cache configuration rejected: %s; running without a pool\n", "pager", e.what());
-            return;
+            GGML_LOG_ERROR("%s: cache configuration rejected: %s\n", "pager", e.what());
+            return POOL_CACHE_FAILED;
         }
         n_slots = cache->max_slots();
         GGML_ASSERT(n_slots + 1 <= phys_slots);
@@ -880,11 +1019,11 @@ struct ggml_cuda_pager {
             cudaError_t err = cudaMalloc(&pool[k], pool_bytes[k]);
             if (err != cudaSuccess) {
                 (void) cudaGetLastError();
-                GGML_LOG_ERROR("%s: pool allocation of %.1f MiB failed: %s; running without a pool\n", __func__,
-                               pool_bytes[k] / 1048576.0, cudaGetErrorString(err));
+                pool[k] = nullptr;
+                GGML_LOG_WARN("%s: allocation of %.1f MiB for the pool failed (%s)\n", "pager", pool_bytes[k] / 1048576.0, cudaGetErrorString(err));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
                 free_pools();
-                return;
+                return POOL_ALLOC_FAILED;
             }
             CUDA_CHECK(cudaMemsetAsync(pool[k], 0, pool_bytes[k], stream)); // null slot and row padding stay zero
         }
@@ -896,13 +1035,53 @@ struct ggml_cuda_pager {
         for (int k = 0; k < 3; k++) {
             total += pool_bytes[k];
         }
+        obtained_bytes = total;
         reported_pool_bytes = total;
         g_stats.pool_bytes.fetch_add(total);
+        reset_debug_state();
+        return POOL_OK;
+    }
 
+    void reset_debug_state() {
         slot_st.assign(n_slots, SLOT_FREE);
         slot_key.assign(n_slots, -1);
         slot_claims.assign(n_slots, 0);
         slot_last_read.assign(n_slots, 0);
+    }
+
+    // Build a pool for the requested budget; when the allocation fails (another process took the memory) retry with 3/4 of
+    // the size, down to no pool at all. Never aborts. Called with nothing queued on the pools.
+    void build_pools(cudaStream_t stream) {
+        pools_built = true;
+        ggml_cuda_set_device(device);
+        degraded = false;
+        if (!compute_geometry() || budget == 0) {
+            publish_config();
+            return;
+        }
+        size_t try_budget = budget;
+        pool_status st;
+        for (;;) {
+            st = make_pool(try_budget, stream);
+            if (st == POOL_OK || st == POOL_TOO_SMALL || st == POOL_CACHE_FAILED) {
+                break;
+            }
+            try_budget = try_budget / 4 * 3;
+            degraded = true;
+        }
+        if (st == POOL_TOO_SMALL && try_budget == budget) {
+            GGML_LOG_WARN("%s: pool of %.0f MiB holds fewer than 4 slots of %.2f MiB, running without a pool\n", "pager",
+                          budget / 1048576.0, slot_bytes / 1048576.0);
+        }
+        if (!cache) {
+            degraded = degraded || budget > 0;
+            GGML_LOG_WARN("%s: no pool (requested %.0f MiB): every expert is served by the CPU\n", "pager", budget / 1048576.0);
+            publish_config();
+            return;
+        }
+        if (degraded) {
+            GGML_LOG_WARN("%s: requested %.0f MiB, obtained %.0f MiB (device memory is short)\n", "pager", budget / 1048576.0, obtained_bytes / 1048576.0);
+        }
 
         // host to device bandwidth: measured once through the real copy path, or GGML_CUDA_PAGER_GBPS
         const double gbps_env = pager_env_double("GGML_CUDA_PAGER_GBPS", 0.0);
@@ -912,23 +1091,207 @@ struct ggml_cuda_pager {
                 (g.pinned ? any_pinned : any_pageable) = true;
             }
         }
-        if (gbps_env > 0.0) {
-            bw_bytes_per_us = gbps_env * 1e3;
-        } else {
-            bw_bytes_per_us = measure_bandwidth(stream);
+        if (!bw_known) {
+            bw_bytes_per_us = gbps_env > 0.0 ? gbps_env * 1e3 : measure_bandwidth(stream);
+            bw_known = true;
+            g_stats.bw_mbps.store((uint64_t) (bw_bytes_per_us), std::memory_order_relaxed);
         }
-        g_stats.bw_mbps.store((uint64_t) (bw_bytes_per_us), std::memory_order_relaxed);
-        if (!sync_copy) {
+        if (!sync_copy && !copier) {
             copier = std::make_unique<pager_copier>(device, (size_t) pager_env_double("GGML_CUDA_PAGER_COPY_DEPTH", 1.0));
         }
         last_issue_us = pager_now_us();
         credit = 0.0;
         GGML_LOG_INFO("%s: %u slots of %.2f MiB (%d layers x %u experts, strides %.2f/%.2f/%.2f MiB; unpadded mean %.2f MiB, largest %.2f MiB), "
                       "budget %.0f MiB + staging %.0f MiB, pool %.0f MiB; host weights %s; copy bandwidth %.1f GB/s%s\n", "pager",
-                      n_slots, slot_bytes / 1048576.0, n_cached, epl, stride[0] / 1048576.0, stride[1] / 1048576.0, stride[2] / 1048576.0,
-                      unpadded / n_cached / 1048576.0, worst / 1048576.0, cc.budget_bytes / 1048576.0, staging / 1048576.0, total / 1048576.0,
+                      n_slots, slot_bytes / 1048576.0, n_cached_groups, epl, stride[0] / 1048576.0, stride[1] / 1048576.0, stride[2] / 1048576.0,
+                      unpadded_mean / 1048576.0, worst_expert / 1048576.0, cc_.budget_bytes / 1048576.0, cc_.staging_bytes / 1048576.0,
+                      obtained_bytes / 1048576.0,
                       any_pageable ? (any_pinned ? "partly pageable" : "pageable (bounce buffers)") : "pinned", bw_bytes_per_us / 1e3,
                       gbps_env > 0.0 ? " (GGML_CUDA_PAGER_GBPS)" : " (measured)");
+        publish_config();
+    }
+
+    void publish_config() {
+        g_stats.policy.store((int) policy);
+        g_stats.admit_misses.store(admit_misses);
+        g_stats.admit_window.store(admit_window);
+        g_stats.n_slots.store(n_slots);
+        g_stats.slot_bytes.store(slot_bytes);
+        g_stats.obtained_mib.store((int64_t) (obtained_bytes / 1048576));
+    }
+
+    // ---- run-time reconfiguration ------------------------------------------------------------------------------------------
+
+    int group_of_layer(int layer) const {
+        auto it = layer_to_gid.find(layer);
+        if (it != layer_to_gid.end()) {
+            return it->second;
+        }
+        return layer_to_gid.empty() && layer >= 0 && layer < (int) groups.size() ? layer : -1;
+    }
+
+    // warm set (highest priority first) and pins; non-static policies queue them as hints that the copier works off at its
+    // normal bandwidth budget, the static policy installs them (synchronous copies, once)
+    void apply_warm(const std::vector<int32_t> & warm, const std::vector<int32_t> & pinned, cudaStream_t stream) {
+        uint32_t queued = 0, skipped = 0, pins = 0;
+        warm_keys.clear();
+        warm_out.clear();
+        if (cache) {
+            const size_t n = warm.size() / 2;
+            // a warm set fills free slots; hints beyond that would evict residents that earned their place
+            int64_t room = (int64_t) (cc_.budget_bytes / slot_bytes) - (int64_t) cache->resident_count();
+            for (size_t i = 0; i < n; i++) {
+                const int gid = group_of_layer(warm[2 * i]);
+                const int e = warm[2 * i + 1];
+                if (gid < 0 || !groups[gid].cached || e < 0 || e >= groups[gid].n_expert) {
+                    skipped++;
+                    continue;
+                }
+                const uint32_t key = (uint32_t) ((size_t) gid * epl + e);
+                if (cache->lookup(key) >= 0) {
+                    queued++;
+                } else if (policy == POLICY_STATIC) {
+                    if (cache->install(key)) {
+                        install_copy(key, stream);
+                        queued++;
+                    } else {
+                        skipped++;
+                    }
+                } else if (room > 0) {
+                    // not queued here: issue_promotions() feeds the warm list to the cache while there are free slots
+                    warm_keys.push_back({ key, 0.99 - 0.98 * (double) i / (double) std::max<size_t>(n, 1) });
+                    room--;
+                    queued++;
+                } else {
+                    skipped++;
+                }
+            }
+            for (size_t i = 0; i < pinned.size() / 2; i++) {
+                const int gid = group_of_layer(pinned[2 * i]);
+                const int e = pinned[2 * i + 1];
+                if (gid < 0 || !groups[gid].cached || e < 0 || e >= groups[gid].n_expert || policy == POLICY_STATIC) {
+                    skipped++;
+                } else if (cache->pin((uint32_t) ((size_t) gid * epl + e))) {
+                    pins++;
+                } else {
+                    skipped++;
+                }
+            }
+        } else {
+            skipped = (uint32_t) (warm.size() / 2 + pinned.size() / 2);
+        }
+        g_stats.warm_queued.store(queued);
+        g_stats.warm_skipped.store(skipped);
+        g_stats.pinned_count.store(pins);
+    }
+
+    // Same pool size: keep the VRAM and the experts that are resident, replace the cache object (new policy / admission
+    // parameters). Residents are re-installed in ascending old slot order, which packs them to slots <= their old ones, and
+    // their rows are moved in place with device-to-device copies on the (idle) compute stream.
+    bool rebuild_cache_keep(cudaStream_t stream) {
+        std::vector<uint32_t> keys;
+        cache->resident_keys(keys);
+        std::vector<std::pair<int, uint32_t>> res; // (old slot, key)
+        for (uint32_t k : keys) {
+            res.emplace_back(cache->lookup(k), k);
+        }
+        std::sort(res.begin(), res.end());
+        cc_.policy              = policy == POLICY_STATIC ? POLICY_LRU : (int) policy;
+        cc_.admit_min_misses    = (uint32_t) std::max(1, admit_misses);
+        cc_.admit_window_tokens = (uint64_t) std::max(0, admit_window);
+        std::unique_ptr<ggml_cuda_pager_cache> fresh;
+        try {
+            fresh = std::make_unique<ggml_cuda_pager_cache>(cc_);
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("%s: cache configuration rejected: %s; keeping the old one\n", "pager", e.what());
+            return false;
+        }
+        GGML_ASSERT(fresh->max_slots() == n_slots);
+        reset_debug_state();
+        for (const auto & [old_slot, key] : res) {
+            if (!fresh->install(key)) {
+                continue; // cannot happen with an unchanged budget
+            }
+            const int ns = fresh->lookup(key);
+            GGML_ASSERT(ns >= 0 && ns <= old_slot);
+            if (ns != old_slot) {
+                for (int k = 0; k < 3; k++) {
+                    CUDA_CHECK(cudaMemcpyAsync((char *) pool[k] + (size_t) (ns + 1) * stride[k], (const char *) pool[k] + (size_t) (old_slot + 1) * stride[k],
+                                               stride[k], cudaMemcpyDeviceToDevice, stream));
+                }
+            }
+#ifndef NDEBUG
+            slot_st[ns] = SLOT_READY;
+            slot_key[ns] = key;
+#endif
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        cache = std::move(fresh);
+        inflight.clear();
+        inflight_bytes = 0;
+        sync_done.clear();
+        pub = {};
+        g_stats.resident.fetch_add((uint64_t) cache->counters().resident - reported_resident);
+        reported_resident = cache->counters().resident;
+        return true;
+    }
+
+    // Apply the pending request of g_ctl. Safe point: the compute stream is idle and this thread launches nothing until it
+    // returns. Sequence: drain the copier, commit what finished, then either keep the pool (same size) or free it, allocate the
+    // new one (3/4 steps down on allocation failure), start a fresh cache and queue the warm set.
+    void apply_pending(cudaStream_t stream_in) {
+        cudaStream_t stream = cur_stream_or(stream_in);
+        std::vector<int32_t> warm, pins;
+        uint64_t gen;
+        int32_t req_mib, req_policy, req_am, req_aw;
+        {
+            std::lock_guard<std::mutex> lk(g_ctl.m);
+            gen = g_ctl.gen_requested.load();
+            req_mib = g_ctl.pool_mib; req_policy = g_ctl.policy; req_am = g_ctl.admit_misses; req_aw = g_ctl.admit_window;
+            warm = g_ctl.warm;
+            pins = g_ctl.pinned;
+        }
+        if (gen == applied_gen) {
+            return;
+        }
+        const uint64_t t0 = pager_now_us();
+        ggml_cuda_set_device(device);
+        const size_t new_budget = req_mib >= 0 ? (size_t) req_mib * 1048576 : budget;
+        if (req_policy >= 0) { policy = (pager_policy) req_policy; }
+        if (req_am >= 1)     { admit_misses = req_am; }
+        if (req_aw >= 0)     { admit_window = req_aw; }
+
+        if (!pools_built) {
+            // nothing allocated yet: the settings take effect when the pool is built
+            budget = new_budget;
+            applied_gen = gen;
+            return;
+        }
+        drain_for_rebuild(stream);
+        const bool same_size = new_budget == budget && cache && !degraded;
+        budget = new_budget;
+        bool kept = false;
+        if (same_size) {
+            kept = rebuild_cache_keep(stream);
+        }
+        if (!kept) {
+            free_pools();
+            build_pools(stream);
+        }
+        if (cache) {
+            apply_warm(warm, pins, stream);
+        } else {
+            apply_warm({}, {}, stream);
+        }
+        publish_config();
+        applied_gen = gen;
+        generation++;
+        g_stats.generation.store(std::max<uint64_t>(g_stats.generation.load(), generation));
+        const uint64_t dt = pager_now_us() - t0;
+        g_stats.rebuild_us.store(dt);
+        GGML_LOG_INFO("%s: reconfigure %llu applied in %.1f ms: pool %.0f MiB requested, %.0f MiB obtained (%u slots), policy %d, admission %d/%d%s; warm %u queued %u skipped, pinned %u\n",
+                      "pager", (unsigned long long) generation, dt / 1000.0, budget / 1048576.0, obtained_bytes / 1048576.0, n_slots, (int) policy,
+                      admit_misses, admit_window, kept ? " (pool kept)" : "", g_stats.warm_queued.load(), g_stats.warm_skipped.load(), g_stats.pinned_count.load());
     }
 
     // bytes per microsecond of the copy path, median of three 48 MiB copies of the first group's expert weights
@@ -983,8 +1346,20 @@ struct ggml_cuda_pager {
             }
         }
         if (!pools_built) {
+            cur_stream = stream;
+            const uint64_t t0 = pager_now_us();
             build_pools(stream);
             prefill(stream);
+            std::vector<int32_t> warm, pins;
+            {
+                std::lock_guard<std::mutex> lk(g_ctl.m);
+                warm = g_ctl.warm;
+                pins = g_ctl.pinned;
+            }
+            if (!warm.empty() || !pins.empty()) {
+                apply_warm(warm, pins, stream);
+            }
+            g_stats.rebuild_us.store(pager_now_us() - t0);
         }
     }
 
@@ -1163,6 +1538,25 @@ struct ggml_cuda_pager {
         const double cap = bw_bytes_per_us * horizon_us;
         credit = std::min(cap, credit + bw_bytes_per_us * (double) (now - last_issue_us));
         last_issue_us = now;
+        // warm set: keep a few hints queued in the cache (never more than the free slots), so it fills the pool instead of
+        // evicting residents that earned their place
+        if (!warm_keys.empty()) {
+            for (auto it = warm_out.begin(); it != warm_out.end();) {
+                it = cache->lookup(*it) >= 0 ? warm_out.erase(it) : std::next(it);
+            }
+            while (!warm_keys.empty() && warm_out.size() < 24) {
+                const int64_t room = (int64_t) (cc_.budget_bytes / slot_bytes) - (int64_t) cache->resident_count() - (int64_t) inflight.size() - (int64_t) warm_out.size();
+                if (room <= 0) {
+                    warm_keys.clear();
+                    break;
+                }
+                const auto [key, prio] = warm_keys.front();
+                warm_keys.pop_front();
+                if (cache->lookup(key) < 0 && cache->hint(key, prio)) {
+                    warm_out.insert(key);
+                }
+            }
+        }
         const double avail = cap - (double) inflight_bytes;
         const double allowed = std::min(credit, avail);
         if (allowed < (double) slot_bytes) {
@@ -1173,6 +1567,7 @@ struct ggml_cuda_pager {
         for (size_t i = 0; i < n; i++) {
             const ggml_cuda_pager_promotion & p = out[i];
             inflight_promo ip;
+            warm_out.erase(p.key);
             ip.issue_us = now;
             ip.issue_tok = tok;
             ip.key = p.key;
@@ -1256,6 +1651,45 @@ struct ggml_cuda_pager {
     }
 
     void exec(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const run_info & r);
+
+#ifndef NDEBUG
+    // Debug-build test hook: GGML_CUDA_PAGER_TEST_RECONF="N:mib,mib,..." requests the next size through the same entry point as
+    // POST /pager every N blocks (cycling); GGML_CUDA_PAGER_TEST_RECONF_WARM=1 attaches a warm set (experts 0..15 of every layer).
+    uint64_t test_blocks = 0;
+    size_t   test_next = 0;
+    void test_reconf_hook() {
+        static const char * spec = getenv("GGML_CUDA_PAGER_TEST_RECONF");
+        if (!spec || !*spec || !scanned) {
+            return;
+        }
+        const long every = atol(spec);
+        if (every <= 0 || ++test_blocks % every != 0) {
+            return;
+        }
+        std::vector<int32_t> sizes;
+        const char * c = strchr(spec, ':');
+        while (c && *c) {
+            sizes.push_back((int32_t) atoi(c + 1));
+            c = strchr(c + 1, ',');
+        }
+        if (sizes.empty()) {
+            return;
+        }
+        std::vector<int32_t> warm;
+        if (pager_env_flag("GGML_CUDA_PAGER_TEST_RECONF_WARM")) {
+            for (int e = 0; e < 16; e++) {
+                for (size_t g = 0; g < groups.size(); g++) {
+                    int layer = -1;
+                    sscanf(groups[g].w[0]->name, "blk.%d.", &layer);
+                    warm.push_back(layer);
+                    warm.push_back(e);
+                }
+            }
+        }
+        ggml_pager_config c2 = { sizes[test_next++ % sizes.size()], -1, -1, -1, warm.data(), (int32_t) (warm.size() / 2), nullptr, 0 };
+        ggml_cuda_pager_configure(&c2);
+    }
+#endif
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1309,6 +1743,14 @@ void ggml_cuda_pager::exec(ggml_backend_cuda_context & ctx, ggml_cgraph *, const
     g_stats.syncs.fetch_add(1, std::memory_order_relaxed);
     g_stats.blocks.fetch_add(1, std::memory_order_relaxed);
 
+    // Run-time reconfiguration (ggml_backend_cuda_pager_configure) is applied here: [A] just completed, nothing is queued on the
+    // compute stream and no kernel of this block has been launched.
+#ifndef NDEBUG
+    test_reconf_hook();
+#endif
+    if (g_ctl.gen_requested.load(std::memory_order_relaxed) != applied_gen) {
+        apply_pending(stream);
+    }
     const bool has_pool = cache && grp.cached;
     // [A] is the synchronisation above. [B]: commit the promotions whose copies completed (the only place slots are freed)
     epoch++;
@@ -1584,6 +2026,22 @@ static ggml_cuda_pager & pager_of(ggml_backend_cuda_context & ctx) {
         ctx.pager = new ggml_cuda_pager(ctx.device);
     }
     return *ctx.pager;
+}
+
+int ggml_cuda_pager_apply() {
+    std::vector<ggml_cuda_pager *> ps;
+    {
+        std::lock_guard<std::mutex> lk(g_ctl.m);
+        ps = g_ctl.pagers;
+    }
+    int n = 0;
+    for (ggml_cuda_pager * p : ps) {
+        if (p->applied_gen != g_ctl.gen_requested.load()) {
+            p->apply_pending(nullptr);
+            n++;
+        }
+    }
+    return n;
 }
 
 void ggml_cuda_pager_destroy(ggml_cuda_pager * pager) {

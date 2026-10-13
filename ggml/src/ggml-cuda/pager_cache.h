@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Policy cache: expert key (layer * experts_per_layer + expert) -> slot. Host only, no CUDA. This is a C++17 facade over the
@@ -25,6 +26,7 @@ struct ggml_cuda_pager_cache_config {
     uint32_t admit_min_misses = 2;
     uint64_t admit_window_tokens = 16;
     uint64_t max_bytes_per_token = 0;
+    uint64_t candidate_ttl_tokens = 0;   // queued candidates older than this are dropped unissued (0: never)
 };
 
 struct ggml_cuda_pager_promotion {
@@ -54,10 +56,14 @@ public:
     bool touch(uint32_t key, uint64_t token);
     bool on_miss(uint32_t key, uint64_t token);
     bool install(uint32_t key);   // resident now if it fits without eviction (static fill, prefill)
+    bool hint(uint32_t key, double priority);  // queue a promotion candidate, bypassing the admission filter (warm set)
+    bool pin(uint32_t key);       // never evicted; queued for promotion if not resident. false: pinned bytes exceed the budget
+    void resident_keys(std::vector<uint32_t> & out) const;  // ascending key order
     size_t next_promotions(uint64_t budget_bytes, ggml_cuda_pager_promotion * out, size_t cap);
     commit_status commit(uint64_t id, uint32_t & slot);
     ggml_cuda_pager_cache_counters counters() const;
     bool verify() const;
+    uint32_t resident_count() const;
 
 private:
     struct impl;

@@ -4,6 +4,7 @@
 #include "log.h"
 
 #include "../src/llama-ext.h"
+#include "ggml-pager.h"
 
 #include <array>
 #include <cassert>
@@ -143,6 +144,32 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
+
+    // The expert pager's VRAM pool (experts in a CUDA<n>_PAGED buffer, which counts as host memory above) is allocated at the first
+    // decode step, after the weights and the compute buffers: it has to be part of the budget or layers get the same memory.
+    if (mparams->tensor_buft_overrides) {
+        ggml_backend_reg_t cuda_reg = ggml_backend_reg_by_name("CUDA");
+        auto get_stats = cuda_reg ? (ggml_backend_cuda_pager_get_stats_t) ggml_backend_reg_get_proc_address(cuda_reg, "ggml_backend_cuda_pager_get_stats") : nullptr;
+        ggml_pager_stats pager_stats = {};
+        if (get_stats) {
+            get_stats(&pager_stats);
+        }
+        for (const llama_model_tensor_buft_override * o = mparams->tensor_buft_overrides; get_stats && o->pattern && pager_stats.pool_mib_requested > 0; ++o) {
+            const std::string bname = ggml_backend_buft_name(o->buft);
+            const std::string suffix = "_PAGED";
+            if (bname.size() <= suffix.size() || bname.compare(bname.size() - suffix.size(), suffix.size(), suffix) != 0) {
+                continue;
+            }
+            const std::string dname = bname.substr(0, bname.size() - suffix.size());
+            for (size_t i = 0; i < devs.size(); i++) {
+                if (dname == ggml_backend_dev_name(devs[i])) {
+                    ret[i].mb.compute += (size_t) pager_stats.pool_mib_requested * 1024 * 1024;
+                    LOG_INF("%s: counting the expert pager pool of %" PRId64 " MiB against %s\n", __func__, pager_stats.pool_mib_requested, dname.c_str());
+                }
+            }
+            break;
+        }
+    }
 
     common_memory_breakdown_print(ctx);
 

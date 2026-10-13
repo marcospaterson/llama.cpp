@@ -330,6 +330,7 @@ The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enab
 | `GGML_CUDA_PAGER_TOKEN_MIB` | `0` | cap on MiB of promotions issued per token (`0`: none) |
 | `GGML_CUDA_PAGER_STAGING_MIB` | `64` | part of the pool reserved for destination slots of in-flight copies (at least two slots, at most a quarter of the pool) |
 | `GGML_CUDA_PAGER_GBPS` | measured | host to device bandwidth used to budget promotions; measured once at pool creation by default |
+| `GGML_CUDA_PAGER_CANDIDATE_TTL` | `128` | queued promotion candidates (warm-set hints included) older than this many tokens are dropped unissued |
 | `GGML_CUDA_PAGER_COPY_DEPTH` | `1` | promotions queued on the copier stream at once; deeper queues delay the small device-to-host copies of the compute stream (measured: Qwen3 4 GiB pool 54.6 tok/s at 1, 47.9 at 2) |
 | `GGML_CUDA_PAGER_SYNC_COPY` | `0` | `1`: copy promotions on the compute stream at the safe point instead of on the copier thread (reproducible runs, bug isolation) |
 | `GGML_CUDA_PAGER_THREADS` | half the hardware threads | threads (including the compute thread) running the CPU path for missed experts |

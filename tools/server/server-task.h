@@ -29,6 +29,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_PAGER, // GET/POST /pager: expert pager state and run-time reconfiguration
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -203,6 +204,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_PAGER: the validated POST body, or null for GET
+    json pager_body;
 
     server_task() = default;
 
@@ -606,6 +610,12 @@ struct server_task_result_get_lora : server_task_result {
 
 struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
+};
+
+// GET/POST /pager
+struct server_task_result_pager : server_task_result {
+    json data;
+    virtual json to_json() override { return data; }
 };
 
 struct server_prompt {

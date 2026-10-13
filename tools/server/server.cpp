@@ -246,6 +246,8 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         routes.post_responses_tok_oai      = models_routes->proxy_post;
         routes.get_lora_adapters           = models_routes->proxy_get;
         routes.post_lora_adapters          = models_routes->proxy_post;
+        routes.get_pager                   = models_routes->proxy_get;
+        routes.post_pager                  = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
 
@@ -299,6 +301,9 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     // LoRA adapters hotswap
     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
+    // expert pager state and run-time reconfiguration (CUDA, --moe-pager)
+    ctx_http.get ("/pager",                    ex_wrapper(routes.get_pager));
+    ctx_http.post("/pager",                    ex_wrapper(routes.post_pager));
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));

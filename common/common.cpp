@@ -4,6 +4,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "ggml-pager.h"
 
 #include "../src/llama-ext.h"
 
@@ -1231,6 +1232,17 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+
+    if (params.moe_pager_mib >= 0) {
+        // initial pool of the CUDA expert pager: becomes the pager's configuration when it is created at the first decode
+        if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA")) {
+            auto configure = (ggml_backend_cuda_pager_configure_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_pager_configure");
+            if (configure) {
+                ggml_pager_config pc = { params.moe_pager_mib, -1, -1, -1, nullptr, 0, nullptr, 0 };
+                configure(&pc);
+            }
+        }
+    }
 
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");

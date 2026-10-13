@@ -56,6 +56,147 @@ static bool server_get_pager_stats(ggml_pager_stats & out) {
     return out.blocks > 0;
 }
 
+
+// ---- expert pager control (GET/POST /pager) ---------------------------------------------------------------------------------
+
+static const char * const PAGER_POLICIES[] = { "lru", "lfu", "fwlru", "static" };
+
+struct server_pager_procs {
+    ggml_backend_cuda_pager_get_stats_t get_stats = nullptr;
+    ggml_backend_cuda_pager_configure_t configure = nullptr;
+    ggml_backend_cuda_pager_apply_t     apply     = nullptr;
+    bool ok() const { return get_stats && configure && apply; }
+};
+
+static server_pager_procs server_get_pager_procs() {
+    server_pager_procs p;
+    if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA")) {
+        p.get_stats = (ggml_backend_cuda_pager_get_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_pager_get_stats");
+        p.configure = (ggml_backend_cuda_pager_configure_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_pager_configure");
+        p.apply     = (ggml_backend_cuda_pager_apply_t)     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_pager_apply");
+    }
+    return p;
+}
+
+static json server_pager_state_json(const ggml_pager_stats & s) {
+    return json {
+        { "enabled",              s.enabled != 0 },
+        { "generation",           s.generation },
+        { "generation_requested", s.generation_requested },
+        { "rebuild_ms",           s.rebuild_ms },
+        { "pool_mib_requested",   s.pool_mib_requested },
+        { "pool_mib_obtained",    s.pool_mib_obtained },
+        { "n_slots",              s.n_slots },
+        { "slot_bytes",           s.slot_bytes },
+        { "policy",               PAGER_POLICIES[std::clamp<int>(s.policy, 0, 3)] },
+        { "admit_misses",         s.admit_misses },
+        { "admit_window",         s.admit_window },
+        { "warm_queued",          s.warm_queued },
+        { "warm_skipped",         s.warm_skipped },
+        { "pinned",               s.pinned_count },
+        { "stats", {
+            { "hits",                 s.hits },
+            { "misses",               s.misses },
+            { "resident_experts",     s.resident_experts },
+            { "pool_bytes",           s.pool_bytes },
+            { "bytes_copied",         s.bytes_copied },
+            { "promotions_issued",    s.promotions_issued },
+            { "promotions_committed", s.promotions_committed },
+            { "promotions_aborted",   s.promotions_aborted },
+            { "evictions",            s.evictions },
+            { "admission_rejected",   s.admission_rejected },
+            { "queue_depth",          s.queue_depth },
+            { "copy_gbps",            s.copy_gbps },
+            { "bandwidth_gbps",       s.bandwidth_gbps },
+            { "blocks",               s.blocks },
+        }},
+    };
+}
+
+// Validates a POST /pager body (all keys optional, unknown keys rejected). Throws std::invalid_argument with the reason.
+static void server_pager_validate(const json & body) {
+    if (!body.is_object()) {
+        throw std::invalid_argument("the body must be a JSON object");
+    }
+    const auto int_in = [&](const char * key, int64_t lo, int64_t hi) {
+        const json & v = body.at(key);
+        if (!v.is_number_integer() || v.get<int64_t>() < lo || v.get<int64_t>() > hi) {
+            throw std::invalid_argument(std::string("'") + key + "' must be an integer in [" + std::to_string(lo) + ", " + std::to_string(hi) + "]");
+        }
+    };
+    const auto pairs = [&](const char * key) {
+        const json & v = body.at(key);
+        if (!v.is_array()) {
+            throw std::invalid_argument(std::string("'") + key + "' must be an array of [layer, expert] pairs");
+        }
+        for (const json & e : v) {
+            if (!e.is_array() || e.size() != 2 || !e[0].is_number_integer() || !e[1].is_number_integer() ||
+                e[0].get<int64_t>() < 0 || e[1].get<int64_t>() < 0 || e[0].get<int64_t>() > INT32_MAX || e[1].get<int64_t>() > INT32_MAX) {
+                throw std::invalid_argument(std::string("'") + key + "' must contain [layer, expert] pairs of non-negative integers");
+            }
+        }
+    };
+    for (auto it = body.begin(); it != body.end(); ++it) {
+        const std::string & k = it.key();
+        if (k == "pool_mib")          { int_in("pool_mib", 0, 1 << 20); }
+        else if (k == "admit_misses") { int_in("admit_misses", 1, 1 << 20); }
+        else if (k == "admit_window") { int_in("admit_window", 0, 1 << 30); }
+        else if (k == "policy") {
+            const json & v = it.value();
+            if (!v.is_string() || std::find_if(std::begin(PAGER_POLICIES), std::end(PAGER_POLICIES), [&](const char * p) { return v.get<std::string>() == p; }) == std::end(PAGER_POLICIES)) {
+                throw std::invalid_argument("'policy' must be one of lru, lfu, fwlru, static");
+            }
+        }
+        else if (k == "warm" || k == "pinned") { pairs(k.c_str()); }
+        else { throw std::invalid_argument("unknown key '" + k + "'"); }
+    }
+}
+
+// Runs on the main loop thread (process_single_task), between two decode steps: the compute stream is idle, so the request is
+// applied at once instead of waiting for the next pager block.
+static json server_pager_handle(const json & body) {
+    const server_pager_procs procs = server_get_pager_procs();
+    ggml_pager_stats s = {};
+    if (body.is_null()) {
+        procs.get_stats(&s);
+        return server_pager_state_json(s);
+    }
+    ggml_pager_config cfg = { -1, -1, -1, -1, nullptr, 0, nullptr, 0 };
+    std::vector<int32_t> warm, pinned;
+    const auto flatten = [](const json & v, std::vector<int32_t> & out) {
+        for (const json & e : v) {
+            out.push_back(e[0].get<int32_t>());
+            out.push_back(e[1].get<int32_t>());
+        }
+    };
+    if (body.contains("pool_mib"))     { cfg.pool_mib     = body["pool_mib"].get<int32_t>(); }
+    if (body.contains("admit_misses")) { cfg.admit_misses = body["admit_misses"].get<int32_t>(); }
+    if (body.contains("admit_window")) { cfg.admit_window = body["admit_window"].get<int32_t>(); }
+    if (body.contains("policy")) {
+        const std::string p = body["policy"].get<std::string>();
+        cfg.policy = (int32_t) (std::find_if(std::begin(PAGER_POLICIES), std::end(PAGER_POLICIES), [&](const char * x) { return p == x; }) - std::begin(PAGER_POLICIES));
+    }
+    if (body.contains("warm"))   { flatten(body["warm"], warm);     cfg.warm   = warm.data();   cfg.n_warm   = (int32_t) (warm.size() / 2); }
+    if (body.contains("pinned")) { flatten(body["pinned"], pinned); cfg.pinned = pinned.data(); cfg.n_pinned = (int32_t) (pinned.size() / 2); }
+
+    const uint64_t gen = procs.configure(&cfg);
+    procs.apply();
+    procs.get_stats(&s);
+    const bool created = s.enabled != 0;
+    return json {
+        { "applied",         created ? s.generation >= gen : true },
+        { "pending_until_first_decode", !created },
+        { "generation",      created ? s.generation : gen },
+        { "pool_mib",        created ? s.pool_mib_obtained : s.pool_mib_requested },
+        { "pool_mib_requested", s.pool_mib_requested },
+        { "rebuild_ms",      created ? s.rebuild_ms : 0.0 },
+        { "n_slots",         s.n_slots },
+        { "warm_queued",     s.warm_queued },
+        { "warm_skipped",    s.warm_skipped },
+        { "pinned",          s.pinned_count },
+    };
+}
+
 // one-line summary at slot release: totals, and the change since the previous summary
 static void server_log_pager_summary() {
     static ggml_pager_stats last = {};
@@ -2958,6 +3099,13 @@ private:
                     }
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_PAGER:
+                {
+                    auto res = std::make_unique<server_task_result_pager>();
+                    res->id = task.id;
+                    res->data = server_pager_handle(task.pager_body);
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_SET_LORA:
                 {
                     auto new_loras = construct_lora_list(task.set_lora);
@@ -5771,6 +5919,79 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // GET/POST /pager: same pattern as /lora-adapters above (post a task to the main loop, wait for its result) - the request
+    // is validated here on the HTTP thread, applied by process_single_task between two decode steps.
+    const auto pager_available = [this](server_res_generator & res) {
+        bool paged = false;
+        for (const auto & o : params.tensor_buft_overrides) {
+            if (o.buft && std::string(ggml_backend_buft_name(o.buft)).find("_PAGED") != std::string::npos) {
+                paged = true;
+            }
+        }
+        if (!paged || !server_get_pager_procs().ok()) {
+            res.error(format_error_response("the expert pager is not enabled (start the server with --moe-pager on a CUDA build)", ERROR_TYPE_NOT_SUPPORTED));
+            return false;
+        }
+        return true;
+    };
+
+    this->get_pager = [this, pager_available](const server_http_req & req) {
+        auto res = create_response();
+        if (!pager_available(*res)) {
+            return res;
+        }
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_PAGER);
+            task.id = rd.get_new_id();
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_pager = [this, pager_available](const server_http_req & req) {
+        auto res = create_response();
+        if (!pager_available(*res)) {
+            return res;
+        }
+        json body;
+        try {
+            body = json::parse(req.body);
+            server_pager_validate(body);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(std::string("invalid pager request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_PAGER);
+            task.id = rd.get_new_id();
+            task.pager_body = std::move(body);
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
         res->ok(result->to_json());
         return res;
     };

@@ -2811,6 +2811,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PAGER"));
     add_opt(common_arg(
+        {"--moe-pager-mib"}, "N",
+        "initial VRAM pool of the expert pager in MiB, staging included (use with --moe-pager; counted by --fit; "
+        "changeable at run time with POST /pager; default: environment variable GGML_CUDA_PAGER_MIB, else 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_pager_mib = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PAGER_MIB"));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {

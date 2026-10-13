@@ -6074,6 +6074,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_pager_get_stats") == 0) {
         return (void *)ggml_cuda_pager_get_stats;
     }
+    if (strcmp(name, "ggml_backend_cuda_pager_configure") == 0) {
+        return (void *)ggml_cuda_pager_configure;
+    }
+    if (strcmp(name, "ggml_backend_cuda_pager_apply") == 0) {
+        return (void *)ggml_cuda_pager_apply;
+    }
     if (strcmp(name, "ggml_backend_cuda_pager_set_cpu_kernels") == 0) {
         return (void *)ggml_cuda_pager_set_cpu_kernels;
     }

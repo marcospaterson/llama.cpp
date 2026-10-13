@@ -49,5 +49,7 @@ void ggml_cuda_pager_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * d
 void ggml_cuda_pager_destroy(ggml_cuda_pager * pager);
 
 // proc addresses (see ggml-pager.h)
+uint64_t ggml_cuda_pager_configure(const ggml_pager_config * cfg);
+int  ggml_cuda_pager_apply();
 void ggml_cuda_pager_set_cpu_kernels(const ggml_pager_cpu_kernels * kernels);
 void ggml_cuda_pager_get_stats(ggml_pager_stats * out);

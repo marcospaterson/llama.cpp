@@ -20,6 +20,7 @@ struct ggml_cuda_pager_cache::impl {
         cfg.promotion.admit_window_tokens = c.admit_window_tokens;
         cfg.promotion.max_bytes_per_token = c.max_bytes_per_token;
         cfg.promotion.staging_bytes       = c.staging_bytes;
+        cfg.promotion.candidate_ttl_tokens = c.candidate_ttl_tokens;
         return cfg;
     }
     explicit impl(const ggml_cuda_pager_cache_config & c) : cache(make(c)) {}
@@ -38,6 +39,15 @@ int ggml_cuda_pager_cache::lookup(uint32_t key) const {
 bool ggml_cuda_pager_cache::touch(uint32_t key, uint64_t token) { return p_->cache.touch(key, token); }
 bool ggml_cuda_pager_cache::on_miss(uint32_t key, uint64_t token) { return p_->cache.on_miss(key, token); }
 bool ggml_cuda_pager_cache::install(uint32_t key) { return p_->cache.install(key); }
+bool ggml_cuda_pager_cache::hint(uint32_t key, double priority) {
+    const eq::pager::ExpertKey k = key;
+    return p_->cache.hint(std::span<const eq::pager::ExpertKey>(&k, 1), priority) > 0;
+}
+bool ggml_cuda_pager_cache::pin(uint32_t key) { return p_->cache.pin(key); }
+void ggml_cuda_pager_cache::resident_keys(std::vector<uint32_t> & out) const {
+    out.resize(p_->cache.snapshot().resident_count);
+    out.resize(p_->cache.resident_keys(std::span<eq::pager::ExpertKey>(out.data(), out.size())));
+}
 
 size_t ggml_cuda_pager_cache::next_promotions(uint64_t budget_bytes, ggml_cuda_pager_promotion * out, size_t cap) {
     eq::pager::Promotion tmp[64];
@@ -73,3 +83,5 @@ ggml_cuda_pager_cache_counters ggml_cuda_pager_cache::counters() const {
 }
 
 bool ggml_cuda_pager_cache::verify() const { return p_->cache.verify_invariants(); }
+
+uint32_t ggml_cuda_pager_cache::resident_count() const { return p_->cache.snapshot().resident_count; }
