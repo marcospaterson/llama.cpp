@@ -67,10 +67,16 @@ static void server_log_pager_summary() {
     const double d_miss = (double) (cur.misses - last.misses);
     const double d_tot  = std::max(d_hit + d_miss, 1.0);
     LOG_INF("pager: hits = %" PRIu64 " (+%.0f), misses = %" PRIu64 " (+%.0f), hit rate = %.3f (since last %.3f), resident = %" PRIu64
-            ", pool = %.1f MiB, copied = %.1f MiB, cpu = %.1f ms (+%.1f), host = %.1f ms (+%.1f), sync = %.1f ms (+%.1f), syncs = %" PRIu64 " (+%" PRIu64 ")\n",
+            ", pool = %.1f MiB, promotions issued/committed/aborted = %" PRIu64 "/%" PRIu64 "/%" PRIu64 " (+%" PRIu64 "/+%" PRIu64 "/+%" PRIu64
+            "), evictions = %" PRIu64 " (+%" PRIu64 "), copied = %.1f MiB (+%.1f), copier %.2f GB/s of %.2f GB/s measured, queue = %" PRIu64
+            ", cpu = %.1f ms (+%.1f), host = %.1f ms (+%.1f), sync = %.1f ms (+%.1f), syncs = %" PRIu64 " (+%" PRIu64 ")\n",
             cur.hits, d_hit, cur.misses, d_miss,
             (double) cur.hits / std::max((double) (cur.hits + cur.misses), 1.0), d_hit / d_tot,
-            cur.resident_experts, cur.pool_bytes / 1048576.0, cur.bytes_copied / 1048576.0,
+            cur.resident_experts, cur.pool_bytes / 1048576.0,
+            cur.promotions_issued, cur.promotions_committed, cur.promotions_aborted,
+            cur.promotions_issued - last.promotions_issued, cur.promotions_committed - last.promotions_committed, cur.promotions_aborted - last.promotions_aborted,
+            cur.evictions, cur.evictions - last.evictions,
+            cur.bytes_copied / 1048576.0, (cur.bytes_copied - last.bytes_copied) / 1048576.0, cur.copy_gbps, cur.bandwidth_gbps, cur.queue_depth,
             cur.cpu_ms, cur.cpu_ms - last.cpu_ms, cur.host_ms, cur.host_ms - last.host_ms, cur.sync_ms, cur.sync_ms - last.sync_ms, cur.syncs, cur.syncs - last.syncs);
     last = cur;
 }

@@ -127,6 +127,12 @@ if (CUDAToolkit_FOUND)
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
+    # expert pager: the vendored slot cache (eq-pager/) and its facade are C++20; only these two files get the flag
+    list(APPEND GGML_SOURCES_CUDA pager_cache.cpp eq-pager/src/slot_cache.cpp)
+    set_source_files_properties(pager_cache.cpp eq-pager/src/slot_cache.cpp PROPERTIES
+        COMPILE_OPTIONS "-std=c++20"
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/eq-pager/include")
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}

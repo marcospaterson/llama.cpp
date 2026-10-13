@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -13,12 +14,63 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #if defined(__x86_64__)
 #define PAGER_CPU_RELAX() __asm__ __volatile__("pause" ::: "memory")
 #else
 #define PAGER_CPU_RELAX() do {} while (0)
 #endif
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Slot lifetime (stage 2). Read this before changing anything below.
+//
+// Actors: the compute thread (runs the backend graph, owns the cache and every decision), the copier thread (moves bytes on its
+// own CUDA stream, never touches the cache), the compute stream. A slot is a row of the three pools; slot id s is pool row s+1
+// (row 0 is the all-zero null slot read by misses). Per slot state machine (debug builds assert every transition):
+//
+//   FREE --issue--> COPYING --commit--> READY --claimed by an issued promotion--> VICTIM --commit (evicted)--> FREE
+//                      |                  ^                                          |
+//                      +--abort-----> FREE  +------ victim touched before commit -----+   (VICTIM -> READY)
+//
+// Only READY and VICTIM slots are ever handed to a kernel (a kernel gets slot ids only through cache->lookup(), and the cache
+// returns a slot only for a key it made resident at commit()). A VICTIM is still resident and usable until its commit.
+//
+// (a) A destination slot is never read before its copy completed and was committed. The cache maps the key to the slot only
+//     inside commit(); the compute thread calls commit(id) only after it popped id from the copier's done list, which the
+//     copier pushes after cudaEventSynchronize() on the event recorded behind the last memcpy of that promotion (sync-copy
+//     mode: after the memcpy was queued on the compute stream, committed one block later). Device writes that completed
+//     before a host-visible event are visible to every kernel launched afterwards. Until then lookup() misses.
+//
+// (b) A slot freed by a commit cannot be read by a kernel queued before the commit, and cannot be overwritten while such a
+//     kernel runs. Every block executes, in this order: [A] cudaStreamSynchronize on the compute stream; [B] commit of the
+//     completed promotions (the only place slots are freed); [C] lookups, which build the ids handed to this block's kernels;
+//     [D] kernel launches; [E] next_promotions(), which may reuse a slot freed in [B] as a destination.
+//     * Every kernel that could read a slot freed in [B] was queued by an earlier block (a kernel reads only slots lookup()
+//       returned in [C] of its own block, and a freed slot is no longer returned). By [A] all of those kernels have
+//       finished, so the freed slot has no reader left. The debug build records, per slot, the epoch (block counter, advanced
+//       at [A]) of the last launch that read it and asserts last_read_epoch < epoch when the slot is freed.
+//     * The write into a reused slot starts at [E] or later on the copier stream, i.e. after [B]; the kernels queued at [D]
+//       of this block do not read it (it was just freed, so [C] cannot have returned it). The next block's kernels read it
+//       only after its commit, which needs the copy to have completed (a).
+//     * A second reuse hazard: a promotion issued at [E] of block k and committed at [B] of block k+j. Its destination was
+//       FREE at issue (asserted), so no VICTIM/READY owner existed.
+//     So a slot freed at commit time in block k is never read after [A] of block k, and never written before [B] of block k.
+//     No extra epoch or event is needed because [A] precedes [B] in every block and nothing frees slots elsewhere.
+//     This argument relies on one thing: slots are freed ONLY at [B]. set_budget() would break it (see below).
+//
+// (c) kAborted: the cache frees the destination at commit; its copy is complete (we only commit completed copies), nothing
+//     ever mapped it, so it simply becomes FREE. kStale cannot happen (no set_budget/reset); it aborts.
+//
+// Not supported yet: shrinking the budget at run time. set_budget() cancels every in-flight promotion and frees their
+// destinations immediately, while the copier may still be writing them. It would need: drain the copier (wait for every
+// in-flight id and drop it) before calling set_budget(), and issue nothing until the drain is done; plus an assertion that no
+// kernel queued before it reads an evicted slot, which [A] already gives if the call is made in [B].
+//
+// Poison (debug builds): a slot is overwritten with a recognisable pattern when it becomes FREE and when it is issued as a
+// destination, both on the copier stream (same stream as the later copy, so the order is exact). A kernel reading a slot it
+// should not then shows up as a large perplexity change.
+// ---------------------------------------------------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------------------------------------------------
 // globals: injected CPU kernels and process-wide telemetry
@@ -38,6 +90,17 @@ struct pager_global_stats {
     std::atomic<uint64_t> host_us{0};
     std::atomic<uint64_t> syncs{0};
     std::atomic<uint64_t> blocks{0};
+    std::atomic<uint64_t> promo_issued{0};
+    std::atomic<uint64_t> promo_committed{0};
+    std::atomic<uint64_t> promo_aborted{0};
+    std::atomic<uint64_t> evictions{0};
+    std::atomic<uint64_t> admission_rejected{0};
+    std::atomic<uint64_t> queue_depth{0};
+    std::atomic<uint64_t> copy_busy_us{0};
+    std::atomic<uint64_t> copy_bytes{0};
+    std::atomic<uint64_t> promo_lat_us{0};   // sum over committed or aborted promotions of issue to commit time
+    std::atomic<uint64_t> promo_lat_tok{0};  // ... and of the tokens elapsed
+    std::atomic<uint64_t> bw_mbps{0};   // measured (or configured) host to device bandwidth, bytes per microsecond
 };
 static pager_global_stats g_stats;
 
@@ -57,6 +120,18 @@ void ggml_cuda_pager_get_stats(ggml_pager_stats * out) {
     out->host_ms          = g_stats.host_us.load(std::memory_order_relaxed) / 1000.0;
     out->syncs            = g_stats.syncs.load(std::memory_order_relaxed);
     out->blocks           = g_stats.blocks.load(std::memory_order_relaxed);
+    out->promotions_issued    = g_stats.promo_issued.load(std::memory_order_relaxed);
+    out->promotions_committed = g_stats.promo_committed.load(std::memory_order_relaxed);
+    out->promotions_aborted   = g_stats.promo_aborted.load(std::memory_order_relaxed);
+    out->evictions            = g_stats.evictions.load(std::memory_order_relaxed);
+    out->admission_rejected   = g_stats.admission_rejected.load(std::memory_order_relaxed);
+    out->queue_depth          = g_stats.queue_depth.load(std::memory_order_relaxed);
+    const uint64_t busy = g_stats.copy_busy_us.load(std::memory_order_relaxed);
+    out->copy_gbps            = busy ? (double) g_stats.copy_bytes.load(std::memory_order_relaxed) / (double) busy / 1e3 : 0.0;
+    out->copy_busy_ms         = busy / 1000.0;
+    out->promo_latency_ms_sum  = g_stats.promo_lat_us.load(std::memory_order_relaxed) / 1000.0;
+    out->promo_latency_tokens_sum = g_stats.promo_lat_tok.load(std::memory_order_relaxed);
+    out->bandwidth_gbps       = g_stats.bw_mbps.load(std::memory_order_relaxed) / 1e3;
 }
 
 static const ggml_type_traits_cpu * pager_cpu_traits(ggml_type type) {
@@ -84,60 +159,6 @@ static int pager_n_threads() {
 static uint64_t pager_now_us() {
     return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
-// ---------------------------------------------------------------------------------------------------------------------
-// policy cache (static fill)
-// ---------------------------------------------------------------------------------------------------------------------
-
-int ggml_cuda_pager_cache::add_class(int n_slots) {
-    n_slots_.push_back(n_slots);
-    next_free_.push_back(1);
-    ready_.emplace_back(n_slots + 1, 0);
-    return (int) n_slots_.size() - 1;
-}
-
-int ggml_cuda_pager_cache::add_layer(int cls, int n_expert) {
-    GGML_ASSERT(cls >= 0 && cls < (int) n_slots_.size());
-    layer_cls_.push_back(cls);
-    slot_of_.emplace_back(n_expert, 0);
-    return (int) layer_cls_.size() - 1;
-}
-
-int ggml_cuda_pager_cache::lookup(int layer, int expert) const {
-    const int slot = slot_of_[layer][expert];
-    return slot > 0 && ready_[layer_cls_[layer]][slot] ? slot : -1;
-}
-
-void ggml_cuda_pager_cache::touch(int layer, int expert) {
-    GGML_UNUSED(layer);
-    GGML_UNUSED(expert);
-}
-
-void ggml_cuda_pager_cache::request_promotion(int layer, int expert) {
-    if (slot_of_[layer][expert] == 0) {
-        pending_.emplace_back(layer, expert);
-    }
-}
-
-std::vector<ggml_cuda_pager_promotion> ggml_cuda_pager_cache::commit() {
-    std::vector<ggml_cuda_pager_promotion> out;
-    for (const auto & [layer, expert] : pending_) {
-        const int cls = layer_cls_[layer];
-        if (slot_of_[layer][expert] != 0 || next_free_[cls] > n_slots_[cls]) {
-            continue; // already promoted by an earlier request, or the pool is full: nothing changes
-        }
-        const int slot = next_free_[cls]++;
-        slot_of_[layer][expert] = slot;
-        out.push_back({layer, expert, cls, slot});
-        n_resident_++;
-    }
-    pending_.clear();
-    return out;
-}
-
-void ggml_cuda_pager_cache::mark_ready(const ggml_cuda_pager_promotion & p) {
-    ready_[p.cls][p.slot] = 1;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -303,47 +324,6 @@ struct pager_host_buf {
 // pager state
 // ---------------------------------------------------------------------------------------------------------------------
 
-struct member_sig {
-    ggml_type type;
-    int64_t   ne0, ne1;
-    size_t    nb1, nb2;
-    bool operator==(const member_sig & o) const {
-        return type == o.type && ne0 == o.ne0 && ne1 == o.ne1 && nb1 == o.nb1 && nb2 == o.nb2;
-    }
-};
-
-struct class_sig {
-    int        n = 0;
-    member_sig m[3] = {};
-    bool operator==(const class_sig & o) const {
-        if (n != o.n) {
-            return false;
-        }
-        for (int k = 0; k < n; k++) {
-            if (!(m[k] == o.m[k])) {
-                return false;
-            }
-        }
-        return true;
-    }
-};
-
-struct pager_class {
-    class_sig sig;
-    int       n_slots = 0;           // usable slots (excluding the null slot); 0 = no pool, every lookup misses
-    void *    pool[3] = {};          // device pools, one per member; slot s of member k at pool[k] + s * sig.m[k].nb2
-    size_t    pool_bytes[3] = {};
-    int       n_layers = 0;
-    int64_t   n_experts = 0;         // sum over layers
-};
-
-struct pager_group {
-    int                 cls = -1;
-    int                 n = 0;       // 1 (single MUL_MAT_ID) or 3 (gate, up, down)
-    const ggml_tensor * w[3] = {};
-    int                 n_expert = 0;
-};
-
 struct block_match {
     bool          fused = false;
     ggml_tensor * gate = nullptr;    // MUL_MAT_ID nodes
@@ -362,44 +342,358 @@ struct mv_task {
     ggml_vec_dot_t  dot;
 };
 
+struct pager_group {
+    int                 n = 0;       // 1 (single MUL_MAT_ID, never cached) or 3 (gate, up, down)
+    const ggml_tensor * w[3] = {};
+    int                 n_expert = 0;
+    bool                cached = false;  // fused group whose experts have a slot in the pools
+    bool                pinned = true;   // the host copy of the weights is page-locked
+};
+
+// ---- copy path ---------------------------------------------------------------------------------------------------------
+
+struct copy_job {
+    uint64_t     id = 0;
+    int          op = 0;          // 0: copy members, 1: poison only
+    int          n = 0;
+    const char * src[3] = {};
+    char *       dst[3] = {};
+    size_t       sz[3] = {};      // bytes to copy per member
+    size_t       span[3] = {};    // bytes of the slot row per member (poison)
+    bool         pinned = true;
+    bool         poison_first = false;
+};
+
+// bounce buffers for a pageable source: copied through page-locked memory, two in flight
+struct pager_bounce {
+    pager_host_buf buf[2];
+    cudaEvent_t    ev[2] = {};
+    bool           used[2] = {false, false};
+    unsigned       next = 0;
+
+    ~pager_bounce() {
+        for (cudaEvent_t e : ev) {
+            if (e) {
+                CUDA_CHECK(cudaEventDestroy(e));
+            }
+        }
+    }
+};
+
+static void pager_do_copy(const copy_job & j, cudaStream_t s, pager_bounce & b) {
+    if (j.op == 1 || j.poison_first) {
+        for (int k = 0; k < j.n; k++) {
+            CUDA_CHECK(cudaMemsetAsync(j.dst[k], 0x7B, j.span[k], s));
+        }
+    }
+    if (j.op == 1) {
+        return;
+    }
+    for (int k = 0; k < j.n; k++) {
+        if (j.pinned) {
+            CUDA_CHECK(cudaMemcpyAsync(j.dst[k], j.src[k], j.sz[k], cudaMemcpyHostToDevice, s));
+        } else {
+            const unsigned i = b.next++ & 1;
+            if (!b.ev[i]) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&b.ev[i], cudaEventDisableTiming));
+            }
+            if (b.used[i]) {
+                CUDA_CHECK(cudaEventSynchronize(b.ev[i]));
+            }
+            void * h = b.buf[i].ensure(j.sz[k]);
+            memcpy(h, j.src[k], j.sz[k]);
+            CUDA_CHECK(cudaMemcpyAsync(j.dst[k], h, j.sz[k], cudaMemcpyHostToDevice, s));
+            CUDA_CHECK(cudaEventRecord(b.ev[i], s));
+            b.used[i] = true;
+        }
+    }
+}
+
+// The copier thread: executes copy jobs on its own stream and reports completed promotion ids. It owns no cache state.
+// Copies are queued ahead without waiting (one event per job, polled in submission order), so the stream stays busy while
+// earlier promotions are still being reported; a job is reported only after the event behind its last memcpy completed.
+class pager_copier {
+public:
+    pager_copier(int device, size_t depth) : device_(device), depth_(std::max<size_t>(1, depth)) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+        for (int i = 0; i < kEvents; i++) {
+            cudaEvent_t e;
+            CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            free_ev_.push_back(e);
+        }
+        thread_ = std::thread([this] { loop(); });
+    }
+
+    ~pager_copier() {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+        ggml_cuda_set_device(device_);
+        for (cudaEvent_t e : free_ev_) {
+            CUDA_CHECK(cudaEventDestroy(e));
+        }
+        CUDA_CHECK(cudaStreamDestroy(stream_));
+    }
+
+    void submit(const copy_job & j) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            q_.push_back(j);
+        }
+        cv_.notify_one();
+    }
+
+    // moves the ids of completed copies into `out`
+    void drain_done(std::vector<uint64_t> & out) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        out.insert(out.end(), done_.begin(), done_.end());
+        done_.clear();
+    }
+
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<uint64_t> busy_us{0};
+
+private:
+    static constexpr int kEvents = 64;
+
+    struct outstanding {
+        cudaEvent_t ev;
+        uint64_t    id;
+        size_t      bytes;
+    };
+
+    void report(const outstanding & o) {
+        bytes.fetch_add(o.bytes, std::memory_order_relaxed);
+        free_ev_.push_back(o.ev);
+        std::lock_guard<std::mutex> lk(mtx_);
+        done_.push_back(o.id);
+    }
+
+    void reap(bool block) {
+        while (!out_.empty()) {
+            const outstanding o = out_.front();
+            if (block) {
+                CUDA_CHECK(cudaEventSynchronize(o.ev));
+            } else if (cudaEventQuery(o.ev) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return;
+            }
+            out_.pop_front();
+            report(o);
+            block = false;
+        }
+    }
+
+    void loop() {
+        ggml_cuda_set_device(device_);
+        pager_bounce bounce;
+        uint64_t mark = 0; // start of the current busy interval, 0 while idle
+        for (;;) {
+            copy_job j;
+            bool have = false;
+            {
+                std::unique_lock<std::mutex> lk(mtx_);
+                if (q_.empty() && out_.empty()) {
+                    if (mark) {
+                        busy_us.fetch_add(pager_now_us() - mark, std::memory_order_relaxed);
+                        mark = 0;
+                    }
+                    cv_.wait(lk, [&] { return stop_ || !q_.empty(); });
+                    if (q_.empty()) {
+                        return; // stop requested and nothing left
+                    }
+                }
+                if (!q_.empty() && out_.size() < depth_) {
+                    j = q_.front();
+                    q_.pop_front();
+                    have = true;
+                }
+            }
+            const uint64_t t_now = pager_now_us();
+            if (mark) {
+                busy_us.fetch_add(t_now - mark, std::memory_order_relaxed);
+            }
+            mark = t_now;
+            if (have) {
+                if (j.op == 0 && free_ev_.empty()) {
+                    reap(true); // out of events: wait for the oldest job
+                }
+                pager_do_copy(j, stream_, bounce);
+                if (j.op == 0) {
+                    size_t total = 0;
+                    for (int k = 0; k < j.n; k++) {
+                        total += j.sz[k];
+                    }
+                    cudaEvent_t e = free_ev_.back();
+                    free_ev_.pop_back();
+                    CUDA_CHECK(cudaEventRecord(e, stream_));
+                    out_.push_back({ e, j.id, total });
+                }
+                reap(false);
+            } else {
+                reap(true); // nothing new to submit: wait for the oldest copy
+            }
+        }
+    }
+
+    int                     device_;
+    size_t                  depth_;   // promotions queued on the copier stream at once
+    cudaStream_t            stream_ = nullptr;
+    std::thread             thread_;
+    std::mutex              mtx_;
+    std::condition_variable cv_;
+    std::deque<copy_job>    q_;       // guarded by mtx_
+    std::vector<uint64_t>   done_;    // guarded by mtx_
+    bool                    stop_ = false;
+    // copier thread only
+    std::vector<cudaEvent_t> free_ev_;
+    std::deque<outstanding>  out_;
+};
+
+// ---- configuration -----------------------------------------------------------------------------------------------------
+
+static double pager_env_double(const char * name, double def) {
+    const char * e = getenv(name);
+    return e && *e ? atof(e) : def;
+}
+
+static bool pager_env_flag(const char * name) {
+    const char * e = getenv(name);
+    return e && atoi(e) != 0;
+}
+
+enum pager_policy { POLICY_LRU = 0, POLICY_LFU = 1, POLICY_FWLRU = 2, POLICY_STATIC = 3 };
+
+static pager_policy pager_policy_from_env() {
+    const char * e = getenv("GGML_CUDA_PAGER_POLICY");
+    if (!e || !*e || strcmp(e, "lru") == 0) {
+        return POLICY_LRU;
+    }
+    if (strcmp(e, "lfu") == 0) {
+        return POLICY_LFU;
+    }
+    if (strcmp(e, "fwlru") == 0) {
+        return POLICY_FWLRU;
+    }
+    if (strcmp(e, "static") == 0) {
+        return POLICY_STATIC;
+    }
+    GGML_LOG_WARN("%s: unknown GGML_CUDA_PAGER_POLICY '%s', using lru\n", "pager", e);
+    return POLICY_LRU;
+}
+
+static uint64_t pager_lcm(uint64_t a, uint64_t b) {
+    uint64_t x = a, y = b;
+    while (y) {
+        const uint64_t t = x % y;
+        x = y;
+        y = t;
+    }
+    return a / x * b;
+}
+
+// ---- the pager -----------------------------------------------------------------------------------------------------------
+
+enum slot_state : uint8_t { SLOT_FREE = 0, SLOT_COPYING = 1, SLOT_READY = 2, SLOT_VICTIM = 3 };
+
+struct inflight_promo {
+    uint64_t issue_us = 0;
+    uint64_t issue_tok = 0;
+    uint32_t key = 0;
+    uint32_t dest = 0;
+    uint32_t n_victims = 0;
+    uint32_t victim_slots[8] = {};
+};
+
 struct ggml_cuda_pager {
     int    device;
-    size_t budget;
+    size_t budget;           // GGML_CUDA_PAGER_MIB in bytes (pool + staging + null slot)
 
-    pager_workers          workers;
-    ggml_cuda_pager_cache  cache;
-    std::vector<pager_class> classes;
+    pager_workers            workers;
     std::vector<pager_group> groups;       // index == cache layer
     std::unordered_map<const ggml_tensor *, int> group_of;
     bool   pools_built = false;
     bool   scanned     = false;
 
+    // pool geometry: three role pools sharing the slot index; row 0 of each is the null slot
+    std::unique_ptr<ggml_cuda_pager_cache> cache;
+    std::unique_ptr<pager_copier>          copier;   // null in sync-copy mode and without a pool
+    pager_bounce                           sync_bounce;
+    void *   pool[3] = {};
+    size_t   stride[3] = {};     // bytes of one slot row per role
+    size_t   pool_bytes[3] = {};
+    uint32_t n_slots = 0;        // usable slots (slot ids 0 .. n_slots-1)
+    uint32_t epl = 0;            // experts per layer of the cache key space
+    size_t   slot_bytes = 0;     // sum of the strides, the cache's expert size
+    pager_policy policy = POLICY_LRU;
+    bool     sync_copy = false;
+
+    // promotions
+    std::unordered_map<uint64_t, inflight_promo> inflight;
+    std::vector<uint64_t> sync_done;
+    size_t   inflight_bytes = 0;
+    double   bw_bytes_per_us = 0.0;
+    double   credit = 0.0;
+    uint64_t last_issue_us = 0;
+    double   tok_ema_us = 20000.0;
+    uint64_t last_tok_us = 0;
+    uint64_t tok = 0;            // token counter, see exec()
+    int      last_gid = -1;
+    uint64_t epoch = 0;          // blocks started (advanced right after the stream synchronisation)
+    cudaStream_t cur_stream = nullptr; // compute stream of the running block (inline jobs)
+#ifndef NDEBUG
+    bool test_early_commit = pager_env_flag("GGML_CUDA_PAGER_TEST_EARLY_COMMIT"); // debug builds only, see run_job()
+    std::unordered_set<uint64_t> early_ids;
+    // negative control 2: serve a miss from the slot its key was evicted from (a read of a FREE slot). 1: the state machine
+    // assertion fires; 2: assertions skipped, the poison pattern is read and the perplexity must jump.
+    int test_stale_read = (int) pager_env_double("GGML_CUDA_PAGER_TEST_STALE_READ", 0);
+    std::unordered_map<uint32_t, uint32_t> stale_slot;
+#endif
+
+    // debug state machine
+    std::vector<uint8_t>  slot_st;
+    std::vector<int64_t>  slot_key;
+    std::vector<uint8_t>  slot_claims;
+    std::vector<uint64_t> slot_last_read;
+
     pager_host_buf h_ids, h_x, h_remap, h_blob;
 
-    uint64_t reported_resident = 0;
-    uint64_t reported_pool_bytes = 0;
+    // published deltas
+    uint64_t reported_resident = 0, reported_pool_bytes = 0;
+    ggml_cuda_pager_cache_counters pub = {};
+    uint64_t pub_copied = 0, pub_busy = 0;
     // this pager's own totals (logged when it is destroyed); expected = sum over blocks of n_used * T
-    uint64_t n_hits = 0, n_misses = 0, n_blocks = 0, n_expected = 0, n_copied = 0;
+    uint64_t n_hits = 0, n_misses = 0, n_blocks = 0, n_expected = 0;
 
     explicit ggml_cuda_pager(int device) :
         device(device), budget(ggml_cuda_pager_budget_bytes()), workers(pager_n_threads()) {
-        GGML_LOG_INFO("%s: device %d, pool %.0f MiB, %d CPU threads\n", "pager", device, budget / 1048576.0, pager_n_threads());
+        policy    = pager_policy_from_env();
+        sync_copy = pager_env_flag("GGML_CUDA_PAGER_SYNC_COPY");
+        static const char * names[] = { "lru", "lfu", "fwlru", "static" };
+        GGML_LOG_INFO("%s: device %d, pool %.0f MiB, policy %s%s, %d CPU threads\n", "pager", device, budget / 1048576.0,
+                      names[policy], sync_copy ? " (synchronous copies)" : "", pager_n_threads());
     }
 
     ~ggml_cuda_pager() {
         // the worker threads are joined by ~pager_workers after this body; they only run inside exec(), which has returned
         ggml_cuda_set_device(device);
-        for (auto & c : classes) {
-            for (int k = 0; k < 3; k++) {
-                if (c.pool[k]) {
-                    CUDA_CHECK(cudaFree(c.pool[k]));
-                }
+        copier.reset(); // joins the copier thread after its queue is empty
+        for (int k = 0; k < 3; k++) {
+            if (pool[k]) {
+                CUDA_CHECK(cudaFree(pool[k]));
             }
         }
         if (n_blocks > 0) {
-            GGML_LOG_INFO("%s: device %d totals: %llu blocks, hits %llu + misses %llu = %llu (expert evaluations expected: %llu), resident %llu, copied %.1f MiB\n",
+            const ggml_cuda_pager_cache_counters c = cache ? cache->counters() : ggml_cuda_pager_cache_counters{};
+            GGML_LOG_INFO("%s: device %d totals: %llu blocks, hits %llu + misses %llu = %llu (expert evaluations expected: %llu), "
+                          "promotions %llu issued / %llu committed / %llu aborted, evictions %llu, resident %u, token counter %llu\n",
                           "pager", device, (unsigned long long) n_blocks, (unsigned long long) n_hits, (unsigned long long) n_misses,
-                          (unsigned long long) (n_hits + n_misses), (unsigned long long) n_expected, (unsigned long long) cache.n_resident(), n_copied / 1048576.0);
+                          (unsigned long long) (n_hits + n_misses), (unsigned long long) n_expected, (unsigned long long) c.issued,
+                          (unsigned long long) c.promotions, (unsigned long long) c.aborted, (unsigned long long) c.evictions, c.resident, (unsigned long long) tok);
         }
         g_stats.resident.fetch_sub(reported_resident);
         g_stats.pool_bytes.fetch_sub(reported_pool_bytes);
@@ -464,12 +758,8 @@ struct ggml_cuda_pager {
     }
 
     // -----------------------------------------------------------------------------------------------------------------
-    // groups, classes, pools
+    // groups and pools
     // -----------------------------------------------------------------------------------------------------------------
-
-    static member_sig sig_of(const ggml_tensor * w) {
-        return { w->type, w->ne[0], w->ne[1], w->nb[1], w->nb[2] };
-    }
 
     // register the weights of a block (idempotent); the cache layer index equals the group index
     int register_group(const ggml_tensor * const * w, int n) {
@@ -479,137 +769,200 @@ struct ggml_cuda_pager {
         }
         pager_group g;
         g.n = n;
-        class_sig sig;
-        sig.n = n;
         for (int k = 0; k < n; k++) {
-            g.w[k]    = w[k];
-            sig.m[k]  = sig_of(w[k]);
+            g.w[k] = w[k];
         }
         g.n_expert = (int) w[0]->ne[2];
-        int cls = -1;
-        for (size_t c = 0; c < classes.size(); c++) {
-            if (classes[c].sig == sig) {
-                cls = (int) c;
-                break;
-            }
+        g.cached   = false; // decided in build_pools; groups seen later stay uncached (all-miss)
+        cudaPointerAttributes attr = {};
+        if (cudaPointerGetAttributes(&attr, w[0]->data) == cudaSuccess) {
+            g.pinned = attr.type == cudaMemoryTypeHost;
+        } else {
+            (void) cudaGetLastError();
+            g.pinned = false;
         }
-        if (cls < 0) {
-            pager_class c;
-            c.sig = sig;
-            classes.push_back(c);
-            cls = (int) classes.size() - 1;
-        }
-        g.cls = cls;
-        classes[cls].n_layers++;
-        classes[cls].n_experts += g.n_expert;
         groups.push_back(g);
         group_of[w[0]] = (int) groups.size() - 1;
         return (int) groups.size() - 1;
     }
 
-    static size_t expert_bytes_padded_tail(const member_sig & s) {
-        return s.ne0 % MATRIX_ROW_PADDING != 0 ? ggml_row_size(s.type, MATRIX_ROW_PADDING - s.ne0 % MATRIX_ROW_PADDING) : 0;
+    static size_t tail_padding(const ggml_tensor * w) {
+        return w->ne[0] % MATRIX_ROW_PADDING != 0 ? ggml_row_size(w->type, MATRIX_ROW_PADDING - w->ne[0] % MATRIX_ROW_PADDING) : 0;
     }
 
-    // Split the budget over the classes in proportion to their total expert bytes (the same resident fraction in every
-    // class), allocate the pools (slot 0 and the row padding zeroed) and create the cache entries. Called once, after the
-    // first graph has been scanned; groups seen later join an existing class or get a class without pool.
+    void free_pools() {
+        for (int k = 0; k < 3; k++) {
+            if (pool[k]) {
+                CUDA_CHECK(cudaFree(pool[k]));
+                pool[k] = nullptr;
+            }
+            pool_bytes[k] = 0;
+        }
+        cache.reset();
+        n_slots = 0;
+        for (pager_group & g : groups) {
+            g.cached = false;
+        }
+    }
+
+    // Called once, after the first graph has been scanned. Experts of every fused group get one common slot size (the sum
+    // of per-role strides, each stride a multiple of the block sizes of all types seen in that role), so the cache has a
+    // single size class; the device pools are budget + staging in total. Anything that does not fit stays uncached.
     void build_pools(cudaStream_t stream) {
         pools_built = true;
-        const int first_group_of_cache = cache.n_layers();
-        GGML_ASSERT(first_group_of_cache == 0);
-
-        // bytes of one slot over all members, and the null slots that are paid for up front
-        std::vector<size_t> bps(classes.size(), 0);
-        double total_bytes = 0.0;
-        size_t null_bytes  = 0;
-        for (size_t c = 0; c < classes.size(); c++) {
-            for (int k = 0; k < classes[c].sig.n; k++) {
-                bps[c] += classes[c].sig.m[k].nb2;
-            }
-            total_bytes += (double) classes[c].n_experts * bps[c];
-            null_bytes  += bps[c];
-        }
-        double frac = 0.0;
-        if (budget > null_bytes && total_bytes > 0.0) {
-            frac = std::min(1.0, (double) (budget - null_bytes) / total_bytes);
-        }
-
         ggml_cuda_set_device(device);
-        uint64_t pool_total = 0;
-        for (size_t c = 0; c < classes.size(); c++) {
-            pager_class & pc = classes[c];
-            int n_slots = (int) std::min<double>(frac * (double) pc.n_experts, (double) pc.n_experts);
-            if (n_slots > 0) {
-                bool ok = true;
-                for (int k = 0; k < pc.sig.n && ok; k++) {
-                    const member_sig & s = pc.sig.m[k];
-                    pc.pool_bytes[k] = s.nb2 * (size_t) (n_slots + 1) + expert_bytes_padded_tail(s);
-                    cudaError_t err = cudaMalloc(&pc.pool[k], pc.pool_bytes[k]);
-                    if (err != cudaSuccess) {
-                        (void) cudaGetLastError();
-                        GGML_LOG_ERROR("%s: pool allocation of %.1f MiB failed: %s; class %zu runs without a pool\n", __func__,
-                                       pc.pool_bytes[k] / 1048576.0, cudaGetErrorString(err), c);
-                        ok = false;
-                    } else {
-                        CUDA_CHECK(cudaMemsetAsync(pc.pool[k], 0, pc.pool_bytes[k], stream));
-                    }
-                }
-                if (!ok) {
-                    for (int k = 0; k < 3; k++) {
-                        if (pc.pool[k]) {
-                            CUDA_CHECK(cudaStreamSynchronize(stream));
-                            CUDA_CHECK(cudaFree(pc.pool[k]));
-                            pc.pool[k] = nullptr;
-                        }
-                        pc.pool_bytes[k] = 0;
-                    }
-                    n_slots = 0;
-                }
+
+        uint64_t unit[3] = { 16, 16, 16 };
+        size_t   maxb[3] = {}, tail[3] = {};
+        int      n_cached = 0;
+        epl = 0;
+        for (const pager_group & g : groups) {
+            epl = std::max<uint32_t>(epl, g.n_expert);
+            if (g.n != 3) {
+                continue;
             }
-            pc.n_slots = n_slots;
+            n_cached++;
             for (int k = 0; k < 3; k++) {
-                pool_total += pc.pool_bytes[k];
+                unit[k] = pager_lcm(unit[k], ggml_type_size(g.w[k]->type));
+                maxb[k] = std::max<size_t>(maxb[k], g.w[k]->nb[2]);
+                tail[k] = std::max<size_t>(tail[k], tail_padding(g.w[k]));
             }
-            const int cc = cache.add_class(n_slots);
-            GGML_ASSERT(cc == (int) c);
-            GGML_LOG_INFO("%s: class %zu: %d layers x %lld experts, %d members, %d slots (%.1f MiB)\n", "pager", c, pc.n_layers,
-                          (long long) (pc.n_experts / std::max(1, pc.n_layers)), pc.sig.n, n_slots,
-                          (pc.pool_bytes[0] + pc.pool_bytes[1] + pc.pool_bytes[2]) / 1048576.0);
+        }
+        if (n_cached == 0 || budget == 0) {
+            return;
+        }
+        slot_bytes = 0;
+        for (int k = 0; k < 3; k++) {
+            stride[k] = (maxb[k] + unit[k] - 1) / unit[k] * unit[k];
+            slot_bytes += stride[k];
+        }
+        size_t unpadded = 0, worst = 0;
+        for (const pager_group & g : groups) {
+            if (g.n == 3) {
+                size_t b = 0;
+                for (int k = 0; k < 3; k++) {
+                    b += g.w[k]->nb[2];
+                }
+                unpadded += b;
+                worst = std::max(worst, b);
+            }
+        }
+        const size_t phys_slots = budget / slot_bytes;       // including the null slot
+        size_t staging = (size_t) (pager_env_double("GGML_CUDA_PAGER_STAGING_MIB", 64.0) * 1048576.0);
+        staging = std::min(staging, budget / 4);
+        staging = std::max<size_t>(staging / slot_bytes, 2) * slot_bytes;
+        if (phys_slots < 4 || (phys_slots - 1) * slot_bytes <= staging + slot_bytes) {
+            GGML_LOG_WARN("%s: pool of %.0f MiB holds fewer than %d slots of %.2f MiB, running without a pool\n", "pager",
+                          budget / 1048576.0, 4, slot_bytes / 1048576.0);
+            return;
+        }
+        ggml_cuda_pager_cache_config cc;
+        cc.n_layers          = (uint32_t) groups.size();
+        cc.experts_per_layer = epl;
+        cc.bytes_per_expert  = (uint32_t) slot_bytes;
+        cc.staging_bytes     = staging;
+        cc.budget_bytes      = (phys_slots - 1) * slot_bytes - staging;
+        cc.policy            = policy == POLICY_STATIC ? POLICY_LRU : (int) policy;
+        cc.half_life_tokens  = pager_env_double("GGML_CUDA_PAGER_HALFLIFE", 64.0);
+        cc.admit_min_misses  = (uint32_t) std::max(1.0, pager_env_double("GGML_CUDA_PAGER_ADMIT_MISSES", 2.0));
+        cc.admit_window_tokens = (uint64_t) std::max(0.0, pager_env_double("GGML_CUDA_PAGER_ADMIT_WINDOW", 16.0));
+        cc.max_bytes_per_token = (uint64_t) (std::max(0.0, pager_env_double("GGML_CUDA_PAGER_TOKEN_MIB", 0.0)) * 1048576.0);
+        try {
+            cache = std::make_unique<ggml_cuda_pager_cache>(cc);
+        } catch (const std::exception & e) {
+            GGML_LOG_ERROR("%s: cache configuration rejected: %s; running without a pool\n", "pager", e.what());
+            return;
+        }
+        n_slots = cache->max_slots();
+        GGML_ASSERT(n_slots + 1 <= phys_slots);
+        for (int k = 0; k < 3; k++) {
+            pool_bytes[k] = stride[k] * (size_t) (n_slots + 1) + tail[k];
+            cudaError_t err = cudaMalloc(&pool[k], pool_bytes[k]);
+            if (err != cudaSuccess) {
+                (void) cudaGetLastError();
+                GGML_LOG_ERROR("%s: pool allocation of %.1f MiB failed: %s; running without a pool\n", __func__,
+                               pool_bytes[k] / 1048576.0, cudaGetErrorString(err));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                free_pools();
+                return;
+            }
+            CUDA_CHECK(cudaMemsetAsync(pool[k], 0, pool_bytes[k], stream)); // null slot and row padding stay zero
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        for (size_t g = 0; g < groups.size(); g++) {
-            const int layer = cache.add_layer(groups[g].cls, groups[g].n_expert);
-            GGML_ASSERT(layer == (int) g);
+        for (pager_group & g : groups) {
+            g.cached = g.n == 3;
         }
-        reported_pool_bytes = pool_total;
-        g_stats.pool_bytes.fetch_add(pool_total);
+        uint64_t total = 0;
+        for (int k = 0; k < 3; k++) {
+            total += pool_bytes[k];
+        }
+        reported_pool_bytes = total;
+        g_stats.pool_bytes.fetch_add(total);
 
-        // test aid: GGML_CUDA_PAGER_PREFILL=1 fills the pools in graph order before the first block (no cold misses)
-        if (getenv("GGML_CUDA_PAGER_PREFILL") && atoi(getenv("GGML_CUDA_PAGER_PREFILL")) != 0) {
-            for (size_t g = 0; g < groups.size(); g++) {
-                if (classes[groups[g].cls].n_slots > 0) {
-                    for (int e = 0; e < groups[g].n_expert; e++) {
-                        cache.request_promotion((int) g, e);
-                    }
-                }
+        slot_st.assign(n_slots, SLOT_FREE);
+        slot_key.assign(n_slots, -1);
+        slot_claims.assign(n_slots, 0);
+        slot_last_read.assign(n_slots, 0);
+
+        // host to device bandwidth: measured once through the real copy path, or GGML_CUDA_PAGER_GBPS
+        const double gbps_env = pager_env_double("GGML_CUDA_PAGER_GBPS", 0.0);
+        bool any_pinned = false, any_pageable = false;
+        for (const pager_group & g : groups) {
+            if (g.n == 3) {
+                (g.pinned ? any_pinned : any_pageable) = true;
             }
-            fill(stream);
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            GGML_LOG_INFO("%s: prefilled %llu experts\n", "pager", (unsigned long long) cache.n_resident());
         }
+        if (gbps_env > 0.0) {
+            bw_bytes_per_us = gbps_env * 1e3;
+        } else {
+            bw_bytes_per_us = measure_bandwidth(stream);
+        }
+        g_stats.bw_mbps.store((uint64_t) (bw_bytes_per_us), std::memory_order_relaxed);
+        if (!sync_copy) {
+            copier = std::make_unique<pager_copier>(device, (size_t) pager_env_double("GGML_CUDA_PAGER_COPY_DEPTH", 1.0));
+        }
+        last_issue_us = pager_now_us();
+        credit = 0.0;
+        GGML_LOG_INFO("%s: %u slots of %.2f MiB (%d layers x %u experts, strides %.2f/%.2f/%.2f MiB; unpadded mean %.2f MiB, largest %.2f MiB), "
+                      "budget %.0f MiB + staging %.0f MiB, pool %.0f MiB; host weights %s; copy bandwidth %.1f GB/s%s\n", "pager",
+                      n_slots, slot_bytes / 1048576.0, n_cached, epl, stride[0] / 1048576.0, stride[1] / 1048576.0, stride[2] / 1048576.0,
+                      unpadded / n_cached / 1048576.0, worst / 1048576.0, cc.budget_bytes / 1048576.0, staging / 1048576.0, total / 1048576.0,
+                      any_pageable ? (any_pinned ? "partly pageable" : "pageable (bounce buffers)") : "pinned", bw_bytes_per_us / 1e3,
+                      gbps_env > 0.0 ? " (GGML_CUDA_PAGER_GBPS)" : " (measured)");
     }
 
-    // late groups (not in the graph seen first)
-    void sync_cache_layers() {
-        while (cache.n_layers() < (int) groups.size()) {
-            pager_group & g = groups[cache.n_layers()];
-            // classes created after build_pools have no cache entry yet and no pool
-            while (cache.n_classes() <= g.cls) {
-                cache.add_class(0);
+    // bytes per microsecond of the copy path, median of three 48 MiB copies of the first group's expert weights
+    double measure_bandwidth(cudaStream_t stream) {
+        const pager_group * g = nullptr;
+        for (const pager_group & c : groups) {
+            if (c.n == 3) {
+                g = &c;
+                break;
             }
-            cache.add_layer(g.cls, g.n_expert);
         }
+        const size_t bytes = std::min<size_t>(48u << 20, std::min<size_t>(g->w[0]->nb[2] * g->n_expert, pool_bytes[0] - tail_padding(g->w[0])));
+        const size_t nexp  = std::max<size_t>(1, bytes / g->w[0]->nb[2]);
+        copy_job j;
+        j.n = 1;
+        j.pinned = g->pinned;
+        double t[3];
+        for (int r = 0; r < 3; r++) {
+            const uint64_t t0 = pager_now_us();
+            size_t total = 0;
+            for (size_t e = 0; e < nexp; e++) {
+                j.src[0] = (const char *) g->w[0]->data + e * g->w[0]->nb[2];
+                j.dst[0] = (char *) pool[0] + stride[0]; // slot 0, overwritten before any use
+                j.sz[0]  = g->w[0]->nb[2];
+                pager_do_copy(j, stream, sync_bounce);
+                total += j.sz[0];
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            t[r] = (double) total / std::max<double>(1.0, (double) (pager_now_us() - t0));
+        }
+        std::sort(t, t + 3);
+        CUDA_CHECK(cudaMemsetAsync(pool[0], 0, stride[0] * 2, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return t[1];
     }
 
     void scan(ggml_cgraph * cgraph, cudaStream_t stream) {
@@ -631,12 +984,245 @@ struct ggml_cuda_pager {
         }
         if (!pools_built) {
             build_pools(stream);
+            prefill(stream);
         }
+    }
+
+    // test aid: GGML_CUDA_PAGER_PREFILL=1 makes the first experts (graph order) resident before the first block, up to the budget
+    void prefill(cudaStream_t stream) {
+        if (!cache || !pager_env_flag("GGML_CUDA_PAGER_PREFILL")) {
+            return;
+        }
+        uint64_t n = 0;
+        for (size_t g = 0; g < groups.size(); g++) {
+            for (int e = 0; groups[g].cached && e < groups[g].n_expert; e++) {
+                const uint32_t key = (uint32_t) (g * epl + e);
+                if (cache->install(key)) {
+                    install_copy(key, stream);
+                    n++;
+                }
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        GGML_LOG_INFO("%s: prefilled %llu experts\n", "pager", (unsigned long long) n);
     }
 
     void prepare(ggml_cgraph * cgraph, cudaStream_t stream) {
         if (!scanned && cgraph) {
             scan(cgraph, stream);
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------------------------------
+    // promotions
+    // -----------------------------------------------------------------------------------------------------------------
+
+    copy_job make_job(uint32_t key, uint32_t slot, uint64_t id) const {
+        const pager_group & g = groups[key / epl];
+        const int e = (int) (key % epl);
+        copy_job j;
+        j.id = id;
+        j.n = 3;
+        j.pinned = g.pinned;
+        for (int k = 0; k < 3; k++) {
+            j.src[k]  = (const char *) g.w[k]->data + (size_t) e * g.w[k]->nb[2];
+            j.dst[k]  = (char *) pool[k] + (size_t) (slot + 1) * stride[k];
+            j.sz[k]   = g.w[k]->nb[2];
+            j.span[k] = stride[k];
+        }
+        return j;
+    }
+
+    void run_job(const copy_job & j, cudaStream_t compute_stream) {
+        if (copier) {
+            copier->submit(j);
+#ifndef NDEBUG
+            if (j.op == 0 && test_early_commit) {
+                // negative control for the poison check: commit before the copy completed, which breaks rule (a)
+                sync_done.push_back(j.id);
+                early_ids.insert(j.id);
+            }
+#endif
+        } else {
+            pager_do_copy(j, compute_stream, sync_bounce);
+            if (j.op == 0) {
+                sync_done.push_back(j.id);
+            }
+        }
+    }
+
+    // static fill: copy on the compute stream, behind the kernels already queued; ready at once (stream order)
+    void install_copy(uint32_t key, cudaStream_t stream) {
+        const int slot = cache->lookup(key);
+        GGML_ASSERT(slot >= 0);
+        const copy_job j = make_job(key, (uint32_t) slot, 0);
+        pager_bounce & b = sync_bounce;
+        pager_do_copy(j, stream, b);
+#ifndef NDEBUG
+        GGML_ASSERT(slot_st[slot] == SLOT_FREE);
+        slot_st[slot] = SLOT_READY;
+        slot_key[slot] = key;
+#endif
+        size_t total = 0;
+        for (int k = 0; k < 3; k++) {
+            total += j.sz[k];
+        }
+        g_stats.bytes_copied.fetch_add(total, std::memory_order_relaxed);
+    }
+
+    // [B] commit the promotions whose copies completed
+    void collect_and_commit() {
+        std::vector<uint64_t> ids;
+        if (copier) {
+            copier->drain_done(ids);
+#ifndef NDEBUG
+            if (test_early_commit) {
+                std::vector<uint64_t> keep;
+                for (uint64_t id : ids) {
+                    if (!early_ids.erase(id)) {
+                        keep.push_back(id);
+                    }
+                }
+                ids.swap(keep);
+                ids.insert(ids.end(), sync_done.begin(), sync_done.end());
+                sync_done.clear();
+            }
+#endif
+        } else {
+            ids.swap(sync_done);
+        }
+        for (uint64_t id : ids) {
+            auto it = inflight.find(id);
+            GGML_ASSERT(it != inflight.end());
+            const inflight_promo p = it->second;
+            inflight.erase(it);
+            g_stats.promo_lat_us.fetch_add(pager_now_us() - p.issue_us, std::memory_order_relaxed);
+            g_stats.promo_lat_tok.fetch_add(tok - p.issue_tok, std::memory_order_relaxed);
+            inflight_bytes -= slot_bytes;
+            uint32_t slot = 0;
+            const ggml_cuda_pager_cache::commit_status st = cache->commit(id, slot);
+            GGML_ASSERT(st != ggml_cuda_pager_cache::stale);
+#ifndef NDEBUG
+            GGML_ASSERT(slot_st[p.dest] == SLOT_COPYING);
+            if (st == ggml_cuda_pager_cache::committed) {
+                GGML_ASSERT(slot == p.dest);
+                slot_st[p.dest] = SLOT_READY;
+                slot_key[p.dest] = p.key;
+            } else {
+                slot_st[p.dest] = SLOT_FREE;
+                slot_key[p.dest] = -1;
+            }
+            for (uint32_t i = 0; i < p.n_victims; i++) {
+                GGML_ASSERT(slot_claims[p.victim_slots[i]] > 0);
+                slot_claims[p.victim_slots[i]]--;
+            }
+#endif
+        }
+#ifndef NDEBUG
+        if (!ids.empty()) {
+            sweep_slots();
+        }
+#endif
+    }
+
+#ifndef NDEBUG
+    // Reconcile the debug state machine with the cache after commits: a slot whose key is no longer resident in it was
+    // evicted (the cache does not report replacement victims chosen after a reclaim, so they are found here).
+    void sweep_slots() {
+        for (uint32_t s = 0; s < n_slots; s++) {
+            if (slot_st[s] != SLOT_READY && slot_st[s] != SLOT_VICTIM) {
+                continue;
+            }
+            if (cache->lookup((uint32_t) slot_key[s]) != (int) s) {
+                // freed: no kernel queued before this block's synchronisation may still read it, none queued after can
+                GGML_ASSERT(slot_last_read[s] < epoch);
+                if (test_stale_read) {
+                    stale_slot[(uint32_t) slot_key[s]] = s;
+                }
+                slot_st[s] = SLOT_FREE;
+                slot_key[s] = -1;
+                copy_job pj;
+                pj.op = 1;
+                pj.n = 3;
+                for (int k = 0; k < 3; k++) {
+                    pj.dst[k]  = (char *) pool[k] + (size_t) (s + 1) * stride[k];
+                    pj.span[k] = stride[k];
+                }
+                run_job(pj, cur_stream);
+            } else {
+                slot_st[s] = slot_claims[s] > 0 ? SLOT_VICTIM : SLOT_READY;
+            }
+        }
+    }
+#endif
+
+    // [E] hand the copier the promotions the cache wants next, within the bandwidth budget
+    void issue_promotions(cudaStream_t stream) {
+        const uint64_t now = pager_now_us();
+        const double horizon_us = std::min(100000.0, std::max(5000.0, tok_ema_us));
+        const double cap = bw_bytes_per_us * horizon_us;
+        credit = std::min(cap, credit + bw_bytes_per_us * (double) (now - last_issue_us));
+        last_issue_us = now;
+        const double avail = cap - (double) inflight_bytes;
+        const double allowed = std::min(credit, avail);
+        if (allowed < (double) slot_bytes) {
+            return;
+        }
+        ggml_cuda_pager_promotion out[64];
+        const size_t n = cache->next_promotions((uint64_t) allowed, out, 64);
+        for (size_t i = 0; i < n; i++) {
+            const ggml_cuda_pager_promotion & p = out[i];
+            inflight_promo ip;
+            ip.issue_us = now;
+            ip.issue_tok = tok;
+            ip.key = p.key;
+            ip.dest = p.dest_slot;
+            ip.n_victims = p.n_victims;
+            for (uint32_t v = 0; v < p.n_victims; v++) {
+                ip.victim_slots[v] = p.victim_slots[v];
+            }
+            inflight[p.id] = ip;
+            inflight_bytes += slot_bytes;
+            credit -= (double) slot_bytes;
+#ifndef NDEBUG
+            GGML_ASSERT(slot_st[p.dest_slot] == SLOT_FREE); // a destination is always a free slot (freed at [B] at the latest)
+            slot_st[p.dest_slot] = SLOT_COPYING;
+            slot_key[p.dest_slot] = p.key;
+            for (uint32_t v = 0; v < p.n_victims; v++) {
+                GGML_ASSERT(slot_st[p.victim_slots[v]] == SLOT_READY || slot_st[p.victim_slots[v]] == SLOT_VICTIM);
+                slot_st[p.victim_slots[v]] = SLOT_VICTIM;
+                slot_claims[p.victim_slots[v]]++;
+            }
+#endif
+            copy_job j = make_job(p.key, p.dest_slot, p.id);
+#ifndef NDEBUG
+            j.poison_first = true;
+#endif
+            run_job(j, stream);
+        }
+    }
+
+    void publish_stats() {
+        if (!cache) {
+            return;
+        }
+        const ggml_cuda_pager_cache_counters c = cache->counters();
+        g_stats.promo_issued.fetch_add(c.issued - pub.issued, std::memory_order_relaxed);
+        g_stats.promo_committed.fetch_add(c.promotions - pub.promotions, std::memory_order_relaxed);
+        g_stats.promo_aborted.fetch_add(c.aborted - pub.aborted, std::memory_order_relaxed);
+        g_stats.evictions.fetch_add(c.evictions - pub.evictions, std::memory_order_relaxed);
+        g_stats.admission_rejected.fetch_add(c.admission_rejected - pub.admission_rejected, std::memory_order_relaxed);
+        g_stats.resident.fetch_add((uint64_t) c.resident - reported_resident);
+        reported_resident = c.resident;
+        pub = c;
+        g_stats.queue_depth.store(inflight.size(), std::memory_order_relaxed);
+        if (copier) {
+            const uint64_t b = copier->bytes.load(std::memory_order_relaxed), u = copier->busy_us.load(std::memory_order_relaxed);
+            g_stats.bytes_copied.fetch_add(b - pub_copied, std::memory_order_relaxed);
+            g_stats.copy_busy_us.fetch_add(u - pub_busy, std::memory_order_relaxed);
+            g_stats.copy_bytes.fetch_add(b - pub_copied, std::memory_order_relaxed);
+            pub_copied = b;
+            pub_busy = u;
         }
     }
 
@@ -656,11 +1242,13 @@ struct ggml_cuda_pager {
         const ggml_tensor * down_w;   // fused only
     };
 
-    static void make_fake(ggml_tensor & f, const ggml_tensor * real, void * base, int n_slots_with_null) {
+    // fake src0 over a role pool: the real tensor's type and shape, the pool as data, the slot stride as the expert stride
+    static void make_fake(ggml_tensor & f, const ggml_tensor * real, void * base, size_t stride, int n_rows) {
         f = *real;
         f.data     = base;
-        f.ne[2]    = n_slots_with_null;
-        f.nb[3]    = f.nb[2] * n_slots_with_null;
+        f.ne[2]    = n_rows;
+        f.nb[2]    = stride;
+        f.nb[3]    = stride * n_rows;
         f.view_src = nullptr;
         f.view_offs = 0;
         f.op       = GGML_OP_NONE;
@@ -668,24 +1256,6 @@ struct ggml_cuda_pager {
     }
 
     void exec(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const run_info & r);
-
-    // let the policy decide the requested promotions and queue the host to VRAM copies on `stream`
-    void fill(cudaStream_t stream) {
-        for (const ggml_cuda_pager_promotion & p : cache.commit()) {
-            const pager_group & pg = groups[p.layer];
-            for (int k = 0; k < pg.n; k++) {
-                const size_t sz = pg.w[k]->nb[2];
-                CUDA_CHECK(cudaMemcpyAsync((char *) classes[p.cls].pool[k] + (size_t) p.slot * sz,
-                    (const char *) pg.w[k]->data + (size_t) p.expert * sz, sz, cudaMemcpyHostToDevice, stream));
-                g_stats.bytes_copied.fetch_add(sz, std::memory_order_relaxed);
-                n_copied += sz;
-            }
-            cache.mark_ready(p);
-        }
-        const uint64_t resident = cache.n_resident();
-        g_stats.resident.fetch_add(resident - reported_resident);
-        reported_resident = resident;
-    }
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -710,8 +1280,7 @@ void ggml_cuda_pager::exec(ggml_backend_cuda_context & ctx, ggml_cgraph *, const
     ggml_cuda_set_device(device);
 
     pager_group & grp = groups[r.gid];
-    pager_class & pc  = classes[grp.cls];
-    const int layer   = r.gid;
+    cur_stream = stream;
 
     const ggml_tensor * ids = r.ids;
     const ggml_tensor * x   = r.x;
@@ -740,24 +1309,71 @@ void ggml_cuda_pager::exec(ggml_backend_cuda_context & ctx, ggml_cgraph *, const
     g_stats.syncs.fetch_add(1, std::memory_order_relaxed);
     g_stats.blocks.fetch_add(1, std::memory_order_relaxed);
 
+    const bool has_pool = cache && grp.cached;
+    // [A] is the synchronisation above. [B]: commit the promotions whose copies completed (the only place slots are freed)
+    epoch++;
+    if (cache) {
+        collect_and_commit();
+    }
+    // Token index for the cache (touch/on_miss/admission window/LFU decay): the count of tokens evaluated through the pager.
+    // A new decode call starts when the block's group index does not exceed the previous block's (layers run in increasing
+    // order within a call); the counter then advances by that call's T and every touch of the call uses the new value, so
+    // a T = 1 decode is the per-sequence step counter, a batch of T tokens (several sequences, or a short prompt) is one
+    // step that counts T tokens, and the index never decreases within a call.
+    if (cache && grp.cached) {
+        if (r.gid <= last_gid || tok == 0) {
+            tok += T;
+            const uint64_t now = pager_now_us();
+            if (last_tok_us != 0 && now - last_tok_us < 1000000) {
+                tok_ema_us = 0.9 * tok_ema_us + 0.1 * (double) (now - last_tok_us);
+            }
+            last_tok_us = now;
+        }
+        last_gid = r.gid;
+    }
+
     // (b) hit or miss per (token, used expert); hits are remapped to their slot, misses to the null slot 0
     struct miss_t { int c, t, e; };
     std::vector<miss_t> miss;
     int32_t * remap_h = (int32_t *) h_remap.ensure((size_t) n_used * T * sizeof(int32_t));
-    const bool has_pool = pc.n_slots > 0 && pc.pool[0] != nullptr;
+    std::vector<uint32_t> static_keys;
     int n_hit = 0;
     for (int t = 0; t < T; t++) {
         for (int c = 0; c < n_used; c++) {
             const int e = ids_h[t * n_used + c];
             GGML_ASSERT(e >= 0 && e < grp.n_expert);
-            const int slot = has_pool ? cache.lookup(layer, e) : -1;
-            if (slot > 0) {
-                remap_h[t * n_used + c] = slot;
-                cache.touch(layer, e);
+            const uint32_t key = (uint32_t) (r.gid * epl + e);
+            int slot = has_pool ? cache->lookup(key) : -1;
+            if (has_pool) {
+                cache->touch(key, tok);
+            }
+#ifndef NDEBUG
+            if (slot < 0 && test_stale_read && has_pool) {
+                auto st = stale_slot.find(key);
+                if (st != stale_slot.end()) {
+                    slot = (int) st->second;
+                }
+            }
+#endif
+            if (slot >= 0) {
+                remap_h[t * n_used + c] = slot + 1; // pool row 0 is the null slot
                 n_hit++;
+#ifndef NDEBUG
+                if (test_stale_read != 2) {
+                    GGML_ASSERT(slot_st[slot] == SLOT_READY || slot_st[slot] == SLOT_VICTIM);
+                }
+                slot_last_read[slot] = epoch;
+#endif
             } else {
                 remap_h[t * n_used + c] = 0;
                 miss.push_back({ c, t, e });
+                if (has_pool) {
+                    if (policy == POLICY_STATIC) {
+                        static_keys.push_back(key);
+                    } else {
+                        cache->on_miss(key, tok);
+                    }
+                }
             }
         }
     }
@@ -873,11 +1489,6 @@ void ggml_cuda_pager::exec(ggml_backend_cuda_context & ctx, ggml_cgraph *, const
     if (n_hit > 0) {
         ggml_cuda_pool_alloc<int32_t> remap_d(ctx.pool(), (size_t) n_used * T);
         CUDA_CHECK(cudaMemcpyAsync(remap_d.get(), remap_h, (size_t) n_used * T * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-#ifndef NDEBUG
-        for (int i = 0; i < n_used * T; i++) {
-            GGML_ASSERT(remap_h[i] == 0 || cache.slot_ready(grp.cls, remap_h[i]));
-        }
-#endif
         ggml_tensor ids_f = {};
         ids_f.type  = GGML_TYPE_I32;
         ids_f.ne[0] = n_used; ids_f.ne[1] = T; ids_f.ne[2] = 1; ids_f.ne[3] = 1;
@@ -888,10 +1499,11 @@ void ggml_cuda_pager::exec(ggml_backend_cuda_context & ctx, ggml_cgraph *, const
         ids_f.data  = remap_d.get();
 
         ggml_tensor fake_a, fake_b, fake_d;
-        make_fake(fake_a, r.fused ? r.gate_w : r.up_w, pc.pool[0], pc.n_slots + 1);
+        GGML_ASSERT(r.fused && has_pool);
+        make_fake(fake_a, r.gate_w, pool[0], stride[0], n_slots + 1);
         if (r.fused) {
-            make_fake(fake_b, r.up_w, pc.pool[1], pc.n_slots + 1);
-            make_fake(fake_d, r.down_w, pc.pool[2], pc.n_slots + 1);
+            make_fake(fake_b, r.up_w, pool[1], stride[1], n_slots + 1);
+            make_fake(fake_d, r.down_w, pool[2], stride[2], n_slots + 1);
             ggml_cuda_mm_fusion_args_host fusion{};
             fusion.gate      = &fake_a;
             fusion.glu_op    = ggml_get_glu_op(r.glu);
@@ -943,13 +1555,22 @@ void ggml_cuda_pager::exec(ggml_backend_cuda_context & ctx, ggml_cgraph *, const
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // static fill: missed experts take the next free slot; the copy is queued behind this block's kernels on the compute
-    // stream, so it is complete before any later kernel can look the slot up
-    if (has_pool && n_miss > 0) {
-        for (const miss_t & ms : miss) {
-            cache.request_promotion(layer, ms.e);
+    // [E] promotions. Static policy: missed experts take a free slot if there is one; the copy is queued behind this block's
+    // kernels on the compute stream, so it is complete before any later kernel can look the slot up. Otherwise the cache
+    // decides what to promote and the copier does it in the background.
+    if (has_pool) {
+        if (policy == POLICY_STATIC) {
+            std::sort(static_keys.begin(), static_keys.end());
+            static_keys.erase(std::unique(static_keys.begin(), static_keys.end()), static_keys.end());
+            for (uint32_t key : static_keys) {
+                if (cache->install(key)) {
+                    install_copy(key, stream);
+                }
+            }
+        } else {
+            issue_promotions(stream);
         }
-        fill(stream);
+        publish_stats();
     }
     g_stats.host_us.fetch_add(pager_now_us() - t_host0, std::memory_order_relaxed);
 }
@@ -984,7 +1605,6 @@ int ggml_cuda_pager_try_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     }
     const ggml_tensor * w[3] = { m.gate->src[0], m.up->src[0], m.down->src[0] };
     const int gid = p.register_group(w, 3);
-    p.sync_cache_layers();
 
     ggml_cuda_pager::run_info r;
     r.gid    = gid;
@@ -1008,7 +1628,6 @@ void ggml_cuda_pager_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * d
     }
     const ggml_tensor * w[1] = { dst->src[0] };
     const int gid = p.register_group(w, 1);
-    p.sync_cache_layers();
 
     ggml_cuda_pager::run_info r;
     r.gid   = gid;

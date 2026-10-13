@@ -319,13 +319,23 @@ The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enab
 
 #### Expert pager (experimental, CUDA)
 
-`--moe-pager` keeps the MoE expert weights (`ffn_{gate,up,down}_exps`) in host memory (buffer type `CUDA<n>_PAGED`, pinned when possible) and serves them through a cache of experts in VRAM; a missed expert is computed on the CPU instead of waiting for a copy. Equivalent to `-ot "\.ffn_(up|down|gate)_exps=CUDA0_PAGED"`.
+`--moe-pager` keeps the MoE expert weights (`ffn_{gate,up,down}_exps`) in host memory (buffer type `CUDA<n>_PAGED`, pinned when possible) and serves them through a cache of experts in VRAM; a missed expert is computed on the CPU instead of waiting for a copy, and a background thread promotes experts the cache wants, evicting others (policy cache vendored from elastic-quant `cpp/pager`). Equivalent to `-ot "\.ffn_(up|down|gate)_exps=CUDA0_PAGED"`.
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `GGML_CUDA_PAGER_MIB` | `0` | VRAM budget of the expert cache in MiB, allocated at the first decode step and not counted by `--fit`. `0`: every expert is a miss |
+| `GGML_CUDA_PAGER_MIB` | `0` | VRAM of the expert pool in MiB, staging included (allocated at the first decode step, not counted by `--fit`). `0`: every expert is a miss |
+| `GGML_CUDA_PAGER_POLICY` | `lru` | `lru`, `lfu` (decayed frequency), `fwlru` (frequency-weighted LRU), or `static`: the stage 1 first-come fill, no eviction |
+| `GGML_CUDA_PAGER_ADMIT_MISSES` / `GGML_CUDA_PAGER_ADMIT_WINDOW` | `2` / `16` | a missed expert is promoted once it missed this many times within this many tokens (the cache's own default is 1 miss, no window; 2 in 16 was better in the trace replay) |
+| `GGML_CUDA_PAGER_HALFLIFE` | `64` | LFU half-life in tokens |
+| `GGML_CUDA_PAGER_TOKEN_MIB` | `0` | cap on MiB of promotions issued per token (`0`: none) |
+| `GGML_CUDA_PAGER_STAGING_MIB` | `64` | part of the pool reserved for destination slots of in-flight copies (at least two slots, at most a quarter of the pool) |
+| `GGML_CUDA_PAGER_GBPS` | measured | host to device bandwidth used to budget promotions; measured once at pool creation by default |
+| `GGML_CUDA_PAGER_COPY_DEPTH` | `1` | promotions queued on the copier stream at once; deeper queues delay the small device-to-host copies of the compute stream (measured: Qwen3 4 GiB pool 54.6 tok/s at 1, 47.9 at 2) |
+| `GGML_CUDA_PAGER_SYNC_COPY` | `0` | `1`: copy promotions on the compute stream at the safe point instead of on the copier thread (reproducible runs, bug isolation) |
 | `GGML_CUDA_PAGER_THREADS` | half the hardware threads | threads (including the compute thread) running the CPU path for missed experts |
-| `GGML_CUDA_PAGER_PREFILL` | `0` | `1`: fill the cache in layer order before the first step (test aid) |
+| `GGML_CUDA_PAGER_PREFILL` | `0` | `1`: make the first experts (layer order) resident before the first step (test aid) |
+
+All experts of the pool share one slot size (the largest expert, padded), so models whose experts differ in size (mixed quantisation types) waste the difference.
 
 Batches of up to 8 tokens use the cache (one stream synchronisation per layer, CUDA graphs disabled); larger batches run the experts on the CPU backend. Statistics are in `/metrics` of `llama-server` and in a line logged when a slot is released.
 

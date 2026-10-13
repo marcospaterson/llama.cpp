@@ -194,7 +194,7 @@ int main() {
     const size_t mib = 1024 * 1024;
     // pools are sized in MiB by the environment variable; the test experts are small, so use the finest granularity available:
     // "all" = generous, "half" = about half of the triplets plus the null slot
-    const long long mib_all  = (long long) ((triplet * (NE + 1) + mib - 1) / mib) + 1;
+    const long long mib_all  = (long long) ((triplet * (NE + 4) * 11 / 10 + mib - 1) / mib) + 1;
     printf("triplet bytes %zu, all-experts pool %lld MiB\n", triplet, mib_all);
 
     for (variant v : { variant::swiglu, variant::geglu }) {
@@ -227,9 +227,18 @@ int main() {
             printf("variant %s T=%d: |out|max %.3f, stock CUDA vs CPU max abs err %.3e\n", v == variant::swiglu ? "swiglu" : "geglu", T,
                    scale, max_abs_diff(ref_cuda.out, ref_cpu.out));
 
-            struct mode_t { const char * name; long long mib; int passes; };
-            for (mode_t m : { mode_t{ "pool 0 (all miss)", 0, 1 }, mode_t{ "pool all, 2nd pass (all hit)", mib_all, 2 }, mode_t{ "pool all, 1st pass (all miss, then fill)", mib_all, 1 },
-                            mode_t{ "pool about half, 2nd pass (hits and misses)", mib_all / 2, 2 } }) {
+            struct mode_t { const char * name; long long mib; int passes; const char * policy; };
+            for (mode_t m : { mode_t{ "pool 0 (all miss)", 0, 1, "static" },
+                              mode_t{ "static fill, 2nd pass (all hit)", mib_all, 2, "static" },
+                              mode_t{ "static fill, 1st pass (all miss, then fill)", mib_all, 1, "static" },
+                              mode_t{ "lru + sync copy, 2nd pass (all hit)", mib_all, 2, "lru" },
+                              mode_t{ "static, about half, 2nd pass (mix)", mib_all / 2, 2, "static" },
+                              mode_t{ "lru + sync copy, about half, 4 passes (mix)", mib_all / 2, 4, "lru" } }) {
+                setenv("GGML_CUDA_PAGER_POLICY", m.policy, 1);
+                setenv("GGML_CUDA_PAGER_SYNC_COPY", "1", 1);
+                setenv("GGML_CUDA_PAGER_ADMIT_MISSES", "1", 1);
+                setenv("GGML_CUDA_PAGER_STAGING_MIB", "1", 1);
+                setenv("GGML_CUDA_PAGER_GBPS", "10000", 1); // no bandwidth limit: promotions are issued as soon as they are wanted
                 setenv("GGML_CUDA_PAGER_MIB", std::to_string(m.mib).c_str(), 1);
                 ggml_pager_stats s0 = {}, s1 = {};
                 get_stats(&s0);
@@ -255,7 +264,9 @@ int main() {
                 // the geglu variant runs gelu on the GPU for the single-node path while the CPU reference uses its f16 gelu table
                 if (m.mib == 0 && !(e_cpu <= (fused ? 1e-4 : 1e-2) * scale)) { bad = true; fprintf(stderr, "    FAIL: all-miss differs from the CPU reference\n"); }
                 if (m.passes == 2 && m.mib == mib_all && fused && e_cuda != 0.0) { bad = true; fprintf(stderr, "    FAIL: all-hit not bit-identical to stock CUDA\n"); }
-                if (m.passes == 2 && m.mib == mib_all && hits != per * NU * T) { bad = true; fprintf(stderr, "    FAIL: second pass was not all hits\n"); }
+                // geglu runs the single-node path, which is never cached
+                const uint64_t want_hits = fused ? NU * T : 0;
+                if (m.passes == 2 && m.mib == mib_all && hits != want_hits) { bad = true; fprintf(stderr, "    FAIL: second pass hits %llu, wanted %llu\n", (unsigned long long) hits, (unsigned long long) want_hits); }
                 if (e_cpu > 3e-2 * scale) { bad = true; fprintf(stderr, "    FAIL: error vs CPU too large\n"); }
                 failures += bad;
             }

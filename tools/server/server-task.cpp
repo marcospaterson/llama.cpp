@@ -1622,11 +1622,22 @@ std::string server_task_result_metrics::to_metrics() {
             { "pager_host_seconds_total", "Compute-thread time inside pager blocks after the synchronisation",   pager.host_ms / 1.e3 },
             { "pager_sync_seconds_total", "Time blocked in the pager's per-layer stream synchronisation",  pager.sync_ms / 1.e3 },
             { "pager_syncs_total",        "Stream synchronisations performed by the pager",                (double) pager.syncs },
+            { "pager_promotions_issued_total",    "Background promotions handed to the copier (pager)",                (double) pager.promotions_issued },
+            { "pager_promotions_committed_total", "Promotions that became resident (pager)",                          (double) pager.promotions_committed },
+            { "pager_promotions_aborted_total",   "Promotions aborted at commit (pager)",                             (double) pager.promotions_aborted },
+            { "pager_evictions_total",            "Experts evicted from the VRAM pool (pager)",                       (double) pager.evictions },
+            { "pager_admission_rejected_total",   "Misses held back by the admission filter (pager)",                 (double) pager.admission_rejected },
+            { "pager_promotion_latency_seconds_total", "Sum of issue to commit time of promotions (pager)",          pager.promo_latency_ms_sum / 1.e3 },
+            { "pager_promotion_latency_tokens_total",  "Sum of issue to commit distance in tokens of promotions (pager)", (double) pager.promo_latency_tokens_sum },
+            { "pager_copy_busy_seconds_total",    "Time the copier thread was busy copying (pager)",                  pager.copy_busy_ms / 1.e3 },
             { "pager_blocks_total",       "Expert blocks executed by the pager",                           (double) pager.blocks },
         });
         add_items("gauge", {
             { "pager_resident_experts",   "Experts resident in the VRAM pool (pager)",                     (double) pager.resident_experts },
             { "pager_pool_bytes",         "VRAM allocated for the pager pools",                            (double) pager.pool_bytes },
+            { "pager_copy_queue_depth",   "Promotions in flight in the copier (pager)",                              (double) pager.queue_depth },
+            { "pager_copy_gbps",          "Achieved copier bandwidth in GB/s (pager)",                               pager.copy_gbps },
+            { "pager_bandwidth_gbps",     "Host to device bandwidth measured when the pool was created (pager)",    pager.bandwidth_gbps },
             { "pager_hit_ratio",          "Cumulative hit ratio of the pager",                             (double) pager.hits / std::max((double) (pager.hits + pager.misses), 1.0) },
         });
     }

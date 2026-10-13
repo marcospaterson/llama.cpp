@@ -1,6 +1,6 @@
 #pragma once
 
-// Expert pager, stage 1 (static fill).
+// Expert pager (stage 2: policy cache, background promotion with eviction; the stage 1 static fill is policy "static").
 //
 // Expert weights live in host memory in the "CUDA<n>_PAGED" buffer type. A VRAM slot pool holds a subset of the experts; the
 // CUDA backend executes MUL_MAT_ID nodes whose weights are paged as one unit per layer:
@@ -14,58 +14,10 @@
 
 #include "common.cuh"
 #include "ggml-pager.h"
+#include "pager_cache.h"
 
 #include <cstdint>
 #include <vector>
-
-// ---------------------------------------------------------------------------------------------------------------------
-// Policy cache: (layer, expert) -> slot. Host only, no CUDA. The kernel-facing code in pager.cu uses only these calls, so a
-// different policy (LRU, background promotion, eviction) can replace the static fill behind the same interface.
-//
-// A slot index is valid in all pools of the class of the layer (gate, up and down of an expert share the index). Slot 0 of
-// every pool is the permanent null slot; usable slots are 1..n_slots. A slot is returned by lookup() only once ready.
-// ---------------------------------------------------------------------------------------------------------------------
-
-struct ggml_cuda_pager_promotion {
-    int layer;
-    int expert;
-    int cls;
-    int slot;
-};
-
-class ggml_cuda_pager_cache {
-public:
-    // Classes group layers whose experts share one slot geometry. n_slots excludes the null slot.
-    int add_class(int n_slots);
-    int add_layer(int cls, int n_expert);
-
-    int n_classes() const { return (int) n_slots_.size(); }
-    int n_layers() const { return (int) layer_cls_.size(); }
-    int layer_class(int layer) const { return layer_cls_[layer]; }
-    int class_slots(int cls) const { return n_slots_[cls]; }
-
-    // slot (>= 1) when the expert is resident and fully written, -1 on a miss
-    int lookup(int layer, int expert) const;
-    // record a use of a resident expert (no-op for the static fill)
-    void touch(int layer, int expert);
-    // ask for the expert to become resident; the policy decides when and which slot (static fill: first free slot at commit)
-    void request_promotion(int layer, int expert);
-    // decide pending requests; the caller must copy each returned promotion into its slot and then call mark_ready()
-    std::vector<ggml_cuda_pager_promotion> commit();
-    void mark_ready(const ggml_cuda_pager_promotion & p);
-
-    bool slot_ready(int cls, int slot) const { return slot >= 1 && slot <= n_slots_[cls] && ready_[cls][slot] != 0; }
-    uint64_t n_resident() const { return n_resident_; }
-
-private:
-    std::vector<int>                  layer_cls_;
-    std::vector<std::vector<int32_t>> slot_of_;   // [layer][expert] -> slot, 0 = not resident / not promoted
-    std::vector<int>                  n_slots_;   // [cls]
-    std::vector<int>                  next_free_; // [cls]
-    std::vector<std::vector<uint8_t>> ready_;     // [cls][slot]
-    std::vector<std::pair<int, int>>  pending_;
-    uint64_t                          n_resident_ = 0;
-};
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Backend hooks (implemented in pager.cu)

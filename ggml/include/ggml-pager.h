@@ -24,6 +24,17 @@ extern "C" {
         double   host_ms;           // compute-thread time inside a block after the synchronisation (lookups, uploads, launches, CPU join)
         uint64_t syncs;             // stream synchronisations performed by the pager
         uint64_t blocks;            // pager-executed blocks (fused or single MUL_MAT_ID)
+        uint64_t promotions_issued;     // background promotions handed to the copier
+        uint64_t promotions_committed;  // ... whose copy finished and that became resident
+        uint64_t promotions_aborted;    // ... committed as aborted (victims reclaimed, no replacement): slot released, never readable
+        uint64_t evictions;             // residents evicted by a commit
+        uint64_t admission_rejected;    // misses held back by the admission filter
+        uint64_t queue_depth;           // promotions in flight (gauge)
+        double   copy_gbps;             // achieved copier bandwidth: bytes copied / copier busy time
+        double   copy_busy_ms;          // copier busy time
+        double   promo_latency_ms_sum;      // sum over promotions (committed or aborted) of the time from issue to commit
+        uint64_t promo_latency_tokens_sum;  // ... and of the tokens elapsed (divide by committed + aborted)
+        double   bandwidth_gbps;        // host to device bandwidth measured at pool creation (or GGML_CUDA_PAGER_GBPS)
     };
 
     // "ggml_backend_cuda_pager_get_stats"
